@@ -39,7 +39,7 @@ if ($group) {
 }
 
 if ($lowStockOnly) {
-    $where[] = 'sb.current_qty <= COALESCE(sb.reorder_level, sb.par_level * 0.3, 5)';
+    $where[] = "sb.stock_status IN ('low', 'critical', 'out')";
 }
 
 $whereClause = 'WHERE ' . implode(' AND ', $where);
@@ -57,8 +57,11 @@ $total = (int) $countStmt->fetchColumn();
 
 // Data
 $stmt = $pdo->prepare("
-    SELECT sb.id, sb.item_id, sb.current_qty, sb.par_level, sb.reorder_level,
-           sb.avg_daily_usage, sb.last_count_date, sb.updated_at,
+    SELECT sb.id, sb.item_id, sb.current_qty, sb.current_value, sb.unit_cost,
+           sb.par_level, sb.min_level, sb.max_level, sb.safety_stock,
+           sb.avg_daily_usage, sb.days_stock_on_hand, sb.stock_status,
+           sb.last_count_date, sb.last_receipt_date, sb.last_issue_date,
+           sb.days_since_last_movement, sb.updated_at,
            i.item_code, i.name as item_name, i.weighted_avg_cost,
            g.code as group_code, g.name as group_name,
            uom.code as uom_code
@@ -74,20 +77,19 @@ $stmt->execute($params);
 $stock = $stmt->fetchAll();
 
 // Camp info
-$camp = $pdo->prepare("SELECT code, name FROM camps WHERE id = ?")->execute([$campId]);
-$camp = $pdo->prepare("SELECT code, name FROM camps WHERE id = ?");
-$camp->execute([$campId]);
-$campInfo = $camp->fetch();
+$campStmt = $pdo->prepare("SELECT code, name FROM camps WHERE id = ?");
+$campStmt->execute([$campId]);
+$campInfo = $campStmt->fetch();
 
 // Summary
 $summaryStmt = $pdo->prepare("
     SELECT
         COUNT(*) as total_items,
-        SUM(sb.current_qty * COALESCE(i.weighted_avg_cost, 0)) as total_value,
-        SUM(CASE WHEN sb.current_qty <= COALESCE(sb.reorder_level, sb.par_level * 0.3, 5) THEN 1 ELSE 0 END) as low_stock_count
+        SUM(sb.current_value) as total_value,
+        SUM(CASE WHEN sb.stock_status IN ('low', 'critical', 'out') THEN 1 ELSE 0 END) as low_stock_count,
+        SUM(CASE WHEN sb.stock_status = 'out' THEN 1 ELSE 0 END) as out_of_stock_count
     FROM stock_balances sb
-    JOIN items i ON sb.item_id = i.id
-    WHERE sb.camp_id = ? AND sb.current_qty > 0
+    WHERE sb.camp_id = ?
 ");
 $summaryStmt->execute([$campId]);
 $summary = $summaryStmt->fetch();
@@ -102,14 +104,9 @@ jsonResponse([
         'total_items' => (int) ($summary['total_items'] ?? 0),
         'total_value' => (float) ($summary['total_value'] ?? 0),
         'low_stock_count' => (int) ($summary['low_stock_count'] ?? 0),
+        'out_of_stock_count' => (int) ($summary['out_of_stock_count'] ?? 0),
     ],
     'stock' => array_map(function($s) {
-        $qty = (float) $s['current_qty'];
-        $parLevel = $s['par_level'] ? (float) $s['par_level'] : null;
-        $stockLevel = 'normal';
-        if ($parLevel && $qty <= $parLevel * 0.3) $stockLevel = 'critical';
-        elseif ($parLevel && $qty <= $parLevel * 0.6) $stockLevel = 'low';
-
         return [
             'id' => (int) $s['id'],
             'item_id' => (int) $s['item_id'],
@@ -117,13 +114,20 @@ jsonResponse([
             'item_name' => $s['item_name'],
             'group_code' => $s['group_code'],
             'uom' => $s['uom_code'],
-            'current_qty' => $qty,
-            'par_level' => $parLevel,
-            'reorder_level' => $s['reorder_level'] ? (float) $s['reorder_level'] : null,
+            'current_qty' => (float) $s['current_qty'],
+            'current_value' => (float) $s['current_value'],
+            'unit_cost' => (float) $s['unit_cost'],
+            'par_level' => $s['par_level'] ? (float) $s['par_level'] : null,
+            'min_level' => $s['min_level'] ? (float) $s['min_level'] : null,
+            'max_level' => $s['max_level'] ? (float) $s['max_level'] : null,
+            'safety_stock' => $s['safety_stock'] ? (float) $s['safety_stock'] : null,
             'avg_daily_usage' => $s['avg_daily_usage'] ? (float) $s['avg_daily_usage'] : null,
-            'stock_value' => $qty * (float) ($s['weighted_avg_cost'] ?? 0),
-            'stock_level' => $stockLevel,
+            'days_stock_on_hand' => $s['days_stock_on_hand'] ? (float) $s['days_stock_on_hand'] : null,
+            'stock_status' => $s['stock_status'],
+            'stock_value' => (float) $s['current_value'],
             'last_count_date' => $s['last_count_date'],
+            'last_receipt_date' => $s['last_receipt_date'],
+            'last_issue_date' => $s['last_issue_date'],
         ];
     }, $stock),
     'pagination' => [

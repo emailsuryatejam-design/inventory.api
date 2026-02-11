@@ -43,11 +43,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
 
     // Receipt lines
     $linesStmt = $pdo->prepare("
-        SELECT rl.*, i.item_code, i.name as item_name, i.stock_uom,
-               ig.code as group_code
+        SELECT rl.id, rl.receipt_id, rl.item_id,
+               rl.expected_qty, rl.received_qty, rl.accepted_qty, rl.rejected_qty,
+               rl.rejection_reason, rl.is_received,
+               rl.batch_number, rl.manufacturing_date, rl.expiry_date,
+               rl.receiving_temperature, rl.quality_notes, rl.discrepancy_note,
+               i.item_code, i.name as item_name,
+               ig.code as group_code,
+               uom.code as uom_code
         FROM receipt_lines rl
         JOIN items i ON rl.item_id = i.id
         LEFT JOIN item_groups ig ON i.item_group_id = ig.id
+        LEFT JOIN units_of_measure uom ON i.stock_uom_id = uom.id
         WHERE rl.receipt_id = ?
         ORDER BY rl.id
     ");
@@ -68,7 +75,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
             'received_date' => $receipt['received_date'],
             'status' => $receipt['status'],
             'notes' => $receipt['notes'],
-            'total_value' => (float) ($receipt['total_value'] ?? 0),
             'created_at' => $receipt['created_at'],
         ],
         'lines' => array_map(function($l) {
@@ -78,13 +84,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
                 'item_code' => $l['item_code'],
                 'item_name' => $l['item_name'],
                 'group_code' => $l['group_code'],
-                'uom' => $l['stock_uom'],
-                'dispatched_qty' => (float) $l['dispatched_qty'],
+                'uom' => $l['uom_code'],
+                'expected_qty' => (float) $l['expected_qty'],
                 'received_qty' => $l['received_qty'] !== null ? (float) $l['received_qty'] : null,
-                'unit_cost' => (float) ($l['unit_cost'] ?? 0),
-                'total_value' => (float) ($l['total_value'] ?? 0),
-                'condition_status' => $l['condition_status'] ?? 'good',
-                'notes' => $l['notes'],
+                'accepted_qty' => $l['accepted_qty'] !== null ? (float) $l['accepted_qty'] : null,
+                'rejected_qty' => $l['rejected_qty'] !== null ? (float) $l['rejected_qty'] : null,
+                'rejection_reason' => $l['rejection_reason'],
+                'is_received' => (bool) $l['is_received'],
+                'batch_number' => $l['batch_number'],
+                'expiry_date' => $l['expiry_date'],
+                'quality_notes' => $l['quality_notes'],
+                'discrepancy_note' => $l['discrepancy_note'],
             ];
         }, $lines),
     ]);
@@ -122,8 +132,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'PUT') {
 
             $lineId = (int) $lineInput['line_id'];
             $receivedQty = (float) ($lineInput['received_qty'] ?? 0);
-            $condition = $lineInput['condition_status'] ?? 'good';
-            $lineNotes = $lineInput['notes'] ?? null;
+            $acceptedQty = (float) ($lineInput['accepted_qty'] ?? $receivedQty);
+            $rejectedQty = (float) ($lineInput['rejected_qty'] ?? 0);
+            $rejectionReason = $lineInput['rejection_reason'] ?? null;
+            $qualityNotes = $lineInput['quality_notes'] ?? null;
 
             // Get line details
             $line = $pdo->prepare("SELECT * FROM receipt_lines WHERE id = ? AND receipt_id = ?");
@@ -131,54 +143,68 @@ if ($_SERVER['REQUEST_METHOD'] === 'PUT') {
             $line = $line->fetch();
             if (!$line) continue;
 
-            $unitCost = (float) ($line['unit_cost'] ?? 0);
-            $lineValue = $receivedQty * $unitCost;
+            $itemId = (int) $line['item_id'];
+
+            // Get unit cost from item
+            $itemData = $pdo->prepare("SELECT weighted_avg_cost, last_purchase_price FROM items WHERE id = ?");
+            $itemData->execute([$itemId]);
+            $itemData = $itemData->fetch();
+            $unitCost = $itemData ? ((float)($itemData['weighted_avg_cost'] ?: $itemData['last_purchase_price'] ?: 0)) : 0;
+            $lineValue = $acceptedQty * $unitCost;
             $totalValue += $lineValue;
 
             // Update receipt line
             $pdo->prepare("
                 UPDATE receipt_lines
-                SET received_qty = ?, condition_status = ?, notes = ?, total_value = ?
+                SET received_qty = ?, accepted_qty = ?, rejected_qty = ?,
+                    rejection_reason = ?, quality_notes = ?, is_received = 1
                 WHERE id = ?
-            ")->execute([$receivedQty, $condition, $lineNotes, $lineValue, $lineId]);
+            ")->execute([$receivedQty, $acceptedQty, $rejectedQty, $rejectionReason, $qualityNotes, $lineId]);
 
-            $itemId = (int) $line['item_id'];
+            // Add to stock balance (only accepted qty)
+            if ($acceptedQty > 0) {
+                $existingStock = $pdo->prepare("SELECT id FROM stock_balances WHERE camp_id = ? AND item_id = ?");
+                $existingStock->execute([$campId, $itemId]);
 
-            // Add to stock balance
-            $existingStock = $pdo->prepare("SELECT id FROM stock_balances WHERE camp_id = ? AND item_id = ?");
-            $existingStock->execute([$campId, $itemId]);
+                if ($existingStock->fetch()) {
+                    $pdo->prepare("
+                        UPDATE stock_balances
+                        SET current_qty = current_qty + ?,
+                            current_value = current_value + ?,
+                            last_receipt_date = CURDATE(),
+                            updated_at = NOW()
+                        WHERE camp_id = ? AND item_id = ?
+                    ")->execute([$acceptedQty, $lineValue, $campId, $itemId]);
+                } else {
+                    $pdo->prepare("
+                        INSERT INTO stock_balances (camp_id, item_id, current_qty, current_value, unit_cost,
+                            last_receipt_date, updated_at)
+                        VALUES (?, ?, ?, ?, ?, CURDATE(), NOW())
+                    ")->execute([$campId, $itemId, $acceptedQty, $lineValue, $unitCost]);
+                }
 
-            if ($existingStock->fetch()) {
+                // Get new balance for stock movement
+                $balStmt = $pdo->prepare("SELECT current_qty FROM stock_balances WHERE camp_id = ? AND item_id = ?");
+                $balStmt->execute([$campId, $itemId]);
+                $newBalance = (float) $balStmt->fetchColumn();
+
+                // Create stock movement
                 $pdo->prepare("
-                    UPDATE stock_balances
-                    SET current_qty = current_qty + ?,
-                        current_value = current_value + ?,
-                        last_receipt_date = CURDATE(),
-                        updated_at = NOW()
-                    WHERE camp_id = ? AND item_id = ?
-                ")->execute([$receivedQty, $lineValue, $campId, $itemId]);
-            } else {
-                $pdo->prepare("
-                    INSERT INTO stock_balances (camp_id, item_id, current_qty, current_value, last_receipt_date, updated_at)
-                    VALUES (?, ?, ?, ?, CURDATE(), NOW())
-                ")->execute([$campId, $itemId, $receivedQty, $lineValue]);
+                    INSERT INTO stock_movements (item_id, camp_id, movement_type, direction, quantity,
+                        unit_cost, total_value, balance_after,
+                        reference_type, reference_id, created_by, movement_date, created_at)
+                    VALUES (?, ?, 'received', 'in', ?, ?, ?, ?, 'receipt', ?, ?, CURDATE(), NOW())
+                ")->execute([$itemId, $campId, $acceptedQty, $unitCost, $lineValue, $newBalance, $id, $auth['user_id']]);
             }
-
-            // Create stock movement
-            $pdo->prepare("
-                INSERT INTO stock_movements (item_id, camp_id, movement_type, quantity, unit_cost, total_value,
-                    reference_type, reference_id, reference_number, created_by, created_at)
-                VALUES (?, ?, 'receipt', ?, ?, ?, 'receipt', ?, ?, ?, NOW())
-            ")->execute([$itemId, $campId, $receivedQty, $unitCost, $lineValue, $id, $receipt['receipt_number'], $auth['user_id']]);
         }
 
-        // Update receipt status and total
+        // Update receipt status
         $pdo->prepare("
             UPDATE receipts
             SET status = 'confirmed', received_by = ?, received_date = CURDATE(),
-                total_value = ?, notes = ?, updated_at = NOW()
+                notes = ?, updated_at = NOW()
             WHERE id = ?
-        ")->execute([$auth['user_id'], $totalValue, $input['notes'] ?? null, $id]);
+        ")->execute([$auth['user_id'], $input['notes'] ?? null, $id]);
 
         $pdo->commit();
 

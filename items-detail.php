@@ -60,12 +60,11 @@ $stockBalances = $stockStmt->fetchAll();
 // Suppliers
 $supplierStmt = $pdo->prepare("
     SELECT
-        iss.supplier_id, sup.name as supplier_name, sup.code as supplier_code,
-        iss.unit_price, iss.lead_time_days, iss.is_preferred,
-        iss.last_order_date
+        iss.supplier_id, sup.name as supplier_name,
+        iss.unit_price, iss.lead_time_days, iss.is_preferred
     FROM item_suppliers iss
     JOIN suppliers sup ON iss.supplier_id = sup.id
-    WHERE iss.item_id = ? AND iss.is_active = 1
+    WHERE iss.item_id = ?
     ORDER BY iss.is_preferred DESC, sup.name
 ");
 $supplierStmt->execute([$id]);
@@ -75,9 +74,9 @@ $suppliers = $supplierStmt->fetchAll();
 $movementStmt = $pdo->prepare("
     SELECT
         sm.id, sm.movement_type, sm.quantity, sm.unit_cost, sm.total_value,
-        sm.reference_type, sm.reference_id, sm.reference_number,
+        sm.reference_type, sm.reference_id,
         sm.camp_id, c.code as camp_code,
-        sm.created_at,
+        sm.movement_date, sm.created_at,
         u.name as created_by_name
     FROM stock_movements sm
     JOIN camps c ON sm.camp_id = c.id
@@ -96,8 +95,8 @@ jsonResponse([
         'sap_item_no' => $item['sap_item_no'],
         'name' => $item['name'],
         'description' => $item['description'],
-        'barcode' => $item['barcode'],
-        'manufacturer' => $item['manufacturer'],
+        'barcode' => $item['barcode'] ?? null,
+        'manufacturer' => $item['manufacturer'] ?? null,
         'group_code' => $item['group_code'],
         'group_name' => $item['group_name'],
         'sub_cat_code' => $item['sub_cat_code'],
@@ -124,7 +123,7 @@ jsonResponse([
         'shelf_life_days' => $item['shelf_life_days'] ? (int) $item['shelf_life_days'] : null,
         'shelf_life_after_opening_days' => $item['shelf_life_after_opening_days'] ? (int) $item['shelf_life_after_opening_days'] : null,
         'haccp_category' => $item['haccp_category'],
-        'allergen_info' => $item['allergen_info'],
+        'allergen_info' => $item['allergen_info'] ?? null,
         'storage_temp_min' => $item['storage_temp_min'] ? (float) $item['storage_temp_min'] : null,
         'storage_temp_max' => $item['storage_temp_max'] ? (float) $item['storage_temp_max'] : null,
         'min_order_qty' => $item['min_order_qty'] ? (float) $item['min_order_qty'] : null,
@@ -155,11 +154,9 @@ jsonResponse([
         return [
             'supplier_id' => (int) $s['supplier_id'],
             'supplier_name' => $s['supplier_name'],
-            'supplier_code' => $s['supplier_code'],
             'unit_price' => $s['unit_price'] ? (float) $s['unit_price'] : null,
             'lead_time_days' => $s['lead_time_days'] ? (int) $s['lead_time_days'] : null,
             'is_preferred' => (bool) $s['is_preferred'],
-            'last_order_date' => $s['last_order_date'],
         ];
     }, $suppliers),
     'recent_movements' => array_map(function($m) {
@@ -167,10 +164,9 @@ jsonResponse([
             'id' => (int) $m['id'],
             'type' => $m['movement_type'],
             'quantity' => (float) $m['quantity'],
-            'unit_cost' => (float) $m['unit_cost'],
-            'total_value' => (float) $m['total_value'],
+            'unit_cost' => (float) ($m['unit_cost'] ?? 0),
+            'total_value' => (float) ($m['total_value'] ?? 0),
             'reference_type' => $m['reference_type'],
-            'reference_number' => $m['reference_number'],
             'camp_code' => $m['camp_code'],
             'created_by' => $m['created_by_name'],
             'created_at' => $m['created_at'],

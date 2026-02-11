@@ -15,12 +15,12 @@ if (!$id) jsonError('Dispatch ID required', 400);
 // Get dispatch with related info
 $stmt = $pdo->prepare("
     SELECT d.*,
-           o.order_number, o.camp_id, o.total_value as order_total_value,
+           o.order_number,
            c.code as camp_code, c.name as camp_name,
            u.name as dispatched_by_name
-    FROM dispatch_notes d
+    FROM dispatches d
     JOIN orders o ON d.order_id = o.id
-    JOIN camps c ON o.camp_id = c.id
+    JOIN camps c ON d.camp_id = c.id
     LEFT JOIN users u ON d.dispatched_by = u.id
     WHERE d.id = ?
 ");
@@ -37,16 +37,15 @@ if (in_array($auth['role'], ['camp_storekeeper', 'camp_manager'])
 
 // Get dispatch lines
 $linesStmt = $pdo->prepare("
-    SELECT dl.*,
+    SELECT dl.id, dl.dispatch_id, dl.item_id, dl.dispatched_qty, dl.unit_cost, dl.total_value,
+           dl.batch_number, dl.expiry_date, dl.source,
            i.item_code, i.name as item_name,
            g.code as group_code,
-           uom.code as uom_code,
-           ol.requested_qty, ol.approved_qty
+           uom.code as uom_code
     FROM dispatch_lines dl
     JOIN items i ON dl.item_id = i.id
     LEFT JOIN item_groups g ON i.item_group_id = g.id
     LEFT JOIN units_of_measure uom ON i.stock_uom_id = uom.id
-    LEFT JOIN order_lines ol ON dl.order_line_id = ol.id
     WHERE dl.dispatch_id = ?
     ORDER BY i.item_code
 ");
@@ -63,11 +62,11 @@ jsonResponse([
         'camp_code' => $dispatch['camp_code'],
         'camp_name' => $dispatch['camp_name'],
         'status' => $dispatch['status'],
-        'total_items' => (int) $dispatch['total_items'],
-        'total_value' => (float) $dispatch['total_value'],
+        'total_value' => (float) ($dispatch['total_value'] ?? 0),
         'dispatched_by' => $dispatch['dispatched_by_name'],
-        'dispatched_at' => $dispatch['dispatched_at'],
-        'vehicle_number' => $dispatch['vehicle_number'],
+        'dispatched_at' => $dispatch['dispatch_date'],
+        'vehicle_number' => $dispatch['vehicle_details'],
+        'driver_name' => $dispatch['driver_name'],
         'notes' => $dispatch['notes'],
         'created_at' => $dispatch['created_at'],
     ],
@@ -80,10 +79,11 @@ jsonResponse([
             'group_code' => $l['group_code'],
             'uom' => $l['uom_code'],
             'dispatched_qty' => (float) $l['dispatched_qty'],
-            'requested_qty' => $l['requested_qty'] ? (float) $l['requested_qty'] : null,
-            'approved_qty' => $l['approved_qty'] ? (float) $l['approved_qty'] : null,
             'unit_cost' => (float) $l['unit_cost'],
-            'line_value' => (float) $l['line_value'],
+            'total_value' => (float) $l['total_value'],
+            'batch_number' => $l['batch_number'],
+            'expiry_date' => $l['expiry_date'],
+            'source' => $l['source'],
         ];
     }, $lines),
 ]);

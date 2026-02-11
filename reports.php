@@ -39,11 +39,11 @@ switch ($type) {
         $stmt = $pdo->prepare("
             SELECT c.code as camp_code, c.name as camp_name,
                    COUNT(*) as item_count,
-                   SUM(sb.current_qty * COALESCE(i.weighted_avg_cost, 0)) as total_value,
-                   SUM(CASE WHEN sb.current_qty <= COALESCE(sb.reorder_level, 5) THEN 1 ELSE 0 END) as low_stock_items
+                   SUM(sb.current_value) as total_value,
+                   SUM(CASE WHEN sb.stock_status IN ('low', 'critical', 'out') THEN 1 ELSE 0 END) as low_stock_items,
+                   SUM(CASE WHEN sb.stock_status = 'out' THEN 1 ELSE 0 END) as out_of_stock_items
             FROM stock_balances sb
             JOIN camps c ON sb.camp_id = c.id
-            JOIN items i ON sb.item_id = i.id
             {$whereClause}
             GROUP BY c.id, c.code, c.name
             ORDER BY c.code
@@ -60,8 +60,8 @@ switch ($type) {
 
     // ── Stock Movement History ──
     case 'movement_history':
-        $where = ["sm.created_at BETWEEN ? AND ?"];
-        $params = [$dateFrom . ' 00:00:00', $dateTo . ' 23:59:59'];
+        $where = ["sm.movement_date BETWEEN ? AND ?"];
+        $params = [$dateFrom, $dateTo];
         if ($campId) {
             $where[] = 'sm.camp_id = ?';
             $params[] = (int) $campId;
@@ -69,8 +69,9 @@ switch ($type) {
         $whereClause = 'WHERE ' . implode(' AND ', $where);
 
         $stmt = $pdo->prepare("
-            SELECT sm.id, sm.movement_type, sm.quantity, sm.reference_type, sm.reference_id,
-                   sm.created_at,
+            SELECT sm.id, sm.movement_type, sm.direction, sm.quantity, sm.unit_cost, sm.total_value,
+                   sm.reference_type, sm.reference_id, sm.movement_date, sm.created_at,
+                   sm.notes,
                    i.item_code, i.name as item_name,
                    c.code as camp_code,
                    u.name as created_by_name
@@ -79,7 +80,7 @@ switch ($type) {
             JOIN camps c ON sm.camp_id = c.id
             LEFT JOIN users u ON sm.created_by = u.id
             {$whereClause}
-            ORDER BY sm.created_at DESC
+            ORDER BY sm.movement_date DESC, sm.created_at DESC
             LIMIT 500
         ");
         $stmt->execute($params);
@@ -140,9 +141,9 @@ switch ($type) {
                    c.code as camp_code,
                    iv.issue_type,
                    SUM(il.quantity) as total_qty,
-                   SUM(il.quantity * il.unit_cost) as total_value
-            FROM issue_lines il
-            JOIN issue_vouchers iv ON il.issue_voucher_id = iv.id
+                   SUM(il.total_value) as total_value
+            FROM issue_voucher_lines il
+            JOIN issue_vouchers iv ON il.voucher_id = iv.id
             JOIN items i ON il.item_id = i.id
             JOIN camps c ON iv.camp_id = c.id
             LEFT JOIN item_groups g ON i.item_group_id = g.id

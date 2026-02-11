@@ -154,12 +154,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 WHERE camp_id = ? AND item_id = ?
             ")->execute([$qty, $lineValue, $campId, $itemId]);
 
+            // Get balance after for stock movement
+            $balStmt = $pdo->prepare("SELECT current_qty FROM stock_balances WHERE camp_id = ? AND item_id = ?");
+            $balStmt->execute([$campId, $itemId]);
+            $balAfter = (float) ($balStmt->fetchColumn() ?: 0);
+
+            // Determine movement type based on issue_type
+            $mvType = 'issue_other';
+            if ($input['issue_type'] === 'kitchen') $mvType = 'issue_kitchen';
+            elseif ($input['issue_type'] === 'rooms') $mvType = 'issue_rooms';
+            elseif ($input['issue_type'] === 'employee') $mvType = 'issue_employee';
+            elseif ($input['issue_type'] === 'waste') $mvType = 'waste';
+
             // Create stock movement
             $pdo->prepare("
-                INSERT INTO stock_movements (item_id, camp_id, movement_type, quantity, unit_cost, total_value,
-                    reference_type, reference_id, reference_number, created_by, created_at)
-                VALUES (?, ?, 'issue', ?, ?, ?, 'issue_voucher', ?, ?, ?, NOW())
-            ")->execute([$itemId, $campId, $qty, $unitCost, $lineValue, $voucherId, $voucherNumber, $auth['user_id']]);
+                INSERT INTO stock_movements (item_id, camp_id, movement_type, direction, quantity, unit_cost, total_value,
+                    balance_after, reference_type, reference_id, cost_center_id, created_by, movement_date, created_at)
+                VALUES (?, ?, ?, 'out', ?, ?, ?, ?, 'issue_voucher', ?, ?, ?, CURDATE(), NOW())
+            ")->execute([$itemId, $campId, $mvType, $qty, $unitCost, $lineValue, $balAfter,
+                         $voucherId, (int) $input['cost_center_id'], $auth['user_id']]);
         }
 
         // Update total

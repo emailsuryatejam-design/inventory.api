@@ -36,11 +36,13 @@ if (in_array($auth['role'], ['camp_storekeeper', 'camp_manager']) && $auth['camp
 
 // Issue lines
 $linesStmt = $pdo->prepare("
-    SELECT ivl.*, i.item_code, i.name as item_name, i.stock_uom,
-           ig.code as group_code
+    SELECT ivl.*, i.item_code, i.name as item_name,
+           ig.code as group_code,
+           uom.code as uom_code
     FROM issue_voucher_lines ivl
     JOIN items i ON ivl.item_id = i.id
     LEFT JOIN item_groups ig ON i.item_group_id = ig.id
+    LEFT JOIN units_of_measure uom ON i.stock_uom_id = uom.id
     WHERE ivl.voucher_id = ?
     ORDER BY ivl.id
 ");
@@ -74,7 +76,7 @@ jsonResponse([
             'item_code' => $l['item_code'],
             'item_name' => $l['item_name'],
             'group_code' => $l['group_code'],
-            'uom' => $l['stock_uom'],
+            'uom' => $l['uom_code'],
             'quantity' => (float) $l['quantity'],
             'unit_cost' => (float) $l['unit_cost'],
             'total_value' => (float) $l['total_value'],

@@ -17,7 +17,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
 
     $stmt = $pdo->query("
         SELECT u.id, u.username, u.name, u.role, u.camp_id, u.is_active,
-               u.pin_enabled, u.approval_limit, u.created_at,
+               u.pin_hash, u.approval_limit, u.phone, u.email,
+               u.last_login, u.created_at,
                c.code as camp_code, c.name as camp_name
         FROM users u
         LEFT JOIN camps c ON u.camp_id = c.id
@@ -36,8 +37,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
                 'camp_code' => $u['camp_code'],
                 'camp_name' => $u['camp_name'],
                 'is_active' => (bool) $u['is_active'],
-                'pin_enabled' => (bool) $u['pin_enabled'],
+                'pin_enabled' => ($u['pin_hash'] !== null && $u['pin_hash'] !== ''),
+                'phone' => $u['phone'],
+                'email' => $u['email'],
                 'approval_limit' => $u['approval_limit'] ? (float) $u['approval_limit'] : null,
+                'last_login' => $u['last_login'],
                 'created_at' => $u['created_at'],
             ];
         }, $users),
@@ -58,15 +62,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         jsonError('Username already exists', 400);
     }
 
-    $stmt = $pdo->prepare("
-        INSERT INTO users (username, name, password_hash, role, camp_id, is_active, pin_enabled, pin_hash, approval_limit, created_at)
-        VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, NOW())
-    ");
-
     $pinHash = null;
     if (!empty($input['pin'])) {
         $pinHash = password_hash($input['pin'], PASSWORD_DEFAULT);
     }
+
+    $stmt = $pdo->prepare("
+        INSERT INTO users (username, name, password_hash, role, camp_id, is_active, pin_hash,
+                          phone, email, approval_limit, created_at)
+        VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, NOW())
+    ");
 
     $stmt->execute([
         $input['username'],
@@ -74,8 +79,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         password_hash($input['password'], PASSWORD_DEFAULT),
         $input['role'],
         $input['camp_id'] ?? null,
-        !empty($input['pin']) ? 1 : 0,
         $pinHash,
+        $input['phone'] ?? null,
+        $input['email'] ?? null,
         $input['approval_limit'] ?? null,
     ]);
 
@@ -129,6 +135,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'PUT') {
         $updates[] = 'approval_limit = ?';
         $params[] = $input['approval_limit'] ?: null;
     }
+    if (isset($input['phone'])) {
+        $updates[] = 'phone = ?';
+        $params[] = $input['phone'] ?: null;
+    }
+    if (isset($input['email'])) {
+        $updates[] = 'email = ?';
+        $params[] = $input['email'] ?: null;
+    }
     if (!empty($input['password'])) {
         $updates[] = 'password_hash = ?';
         $params[] = password_hash($input['password'], PASSWORD_DEFAULT);
@@ -136,11 +150,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'PUT') {
     if (isset($input['pin'])) {
         if ($input['pin']) {
             $updates[] = 'pin_hash = ?';
-            $updates[] = 'pin_enabled = 1';
             $params[] = password_hash($input['pin'], PASSWORD_DEFAULT);
         } else {
             $updates[] = 'pin_hash = NULL';
-            $updates[] = 'pin_enabled = 0';
         }
     }
 
@@ -148,6 +160,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'PUT') {
         jsonError('No fields to update', 400);
     }
 
+    $updates[] = 'updated_at = NOW()';
     $params[] = $id;
     $sql = "UPDATE users SET " . implode(', ', $updates) . " WHERE id = ?";
     $pdo->prepare($sql)->execute($params);
