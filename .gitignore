@@ -1,0 +1,9 @@
+# Don't commit actual config with credentials
+# Use config.example.php as template
+config.php
+
+# Setup script (one-time use)
+setup.php
+
+# OS files
+.DS_Store
