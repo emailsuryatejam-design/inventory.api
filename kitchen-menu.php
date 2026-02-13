@@ -10,6 +10,9 @@
  * GET  ?action=weekly_ingredients&week_start=YYYY-MM-DD — aggregated non-primary ingredients for the week
  *
  * POST ?action=create_plan        — create a new menu plan (date + meal + portions)
+ * POST ?action=update_daily_tracking — update ordered/received/consumed qty on a menu ingredient
+ * POST ?action=update_weekly_grocery — upsert ordered/received qty for a weekly grocery item
+ * POST ?action=add_weekly_grocery    — manually add an item to weekly groceries
  * POST ?action=add_dish           — add a dish to a plan (optionally linked to a recipe)
  * POST ?action=remove_dish        — remove a dish from a plan
  * POST ?action=load_recipe        — load recipe ingredients into a dish
@@ -270,6 +273,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
         // Calculate week end (Sunday)
         $weekEnd = date('Y-m-d', strtotime($weekStart . ' +6 days'));
 
+        // Get projected ingredients from menu plans
         $stmt = $pdo->prepare("
             SELECT mi.item_id,
                    i.name as item_name,
@@ -296,21 +300,80 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
         $stmt->execute([$queryCampId, $queryCampId, $weekStart, $weekEnd]);
         $rows = $stmt->fetchAll();
 
+        // Get tracking data from kitchen_weekly_groceries
+        $trackingStmt = $pdo->prepare("
+            SELECT item_id, projected_qty, ordered_qty, received_qty
+            FROM kitchen_weekly_groceries
+            WHERE camp_id = ? AND week_start = ?
+        ");
+        $trackingStmt->execute([$queryCampId, $weekStart]);
+        $trackingMap = [];
+        foreach ($trackingStmt->fetchAll() as $t) {
+            $trackingMap[(int) $t['item_id']] = $t;
+        }
+
+        // Also get manually added weekly groceries not in the projected list
+        $manualStmt = $pdo->prepare("
+            SELECT wg.item_id, wg.projected_qty, wg.ordered_qty, wg.received_qty,
+                   i.name as item_name, i.item_code, u.code as uom, ig.code as group_code,
+                   COALESCE(sb.current_qty, 0) as stock_qty
+            FROM kitchen_weekly_groceries wg
+            JOIN items i ON wg.item_id = i.id
+            JOIN item_groups ig ON i.item_group_id = ig.id
+            LEFT JOIN units_of_measure u ON i.stock_uom_id = u.id
+            LEFT JOIN stock_balances sb ON sb.item_id = i.id AND sb.camp_id = ?
+            WHERE wg.camp_id = ? AND wg.week_start = ?
+              AND wg.item_id NOT IN (
+                  SELECT mi2.item_id FROM kitchen_menu_ingredients mi2
+                  JOIN kitchen_menu_dishes d2 ON mi2.dish_id = d2.id
+                  JOIN kitchen_menu_plans p2 ON d2.menu_plan_id = p2.id
+                  WHERE p2.camp_id = ? AND p2.plan_date BETWEEN ? AND ?
+                    AND mi2.is_removed = 0 AND mi2.is_primary = 0
+              )
+            ORDER BY i.name
+        ");
+        $manualStmt->execute([$queryCampId, $queryCampId, $weekStart, $queryCampId, $weekStart, $weekEnd]);
+        $manualRows = $manualStmt->fetchAll();
+
+        $ingredients = array_map(function ($r) use ($trackingMap) {
+            $itemId = (int) $r['item_id'];
+            $track = $trackingMap[$itemId] ?? null;
+            return [
+                'item_id'      => $itemId,
+                'item_name'    => $r['item_name'],
+                'item_code'    => $r['item_code'],
+                'uom'          => $r['uom'],
+                'group_code'   => $r['group_code'],
+                'total_qty'    => round((float) $r['total_qty'], 3),
+                'dish_count'   => (int) $r['dish_count'],
+                'stock_qty'    => (float) $r['stock_qty'],
+                'ordered_qty'  => $track ? (float) $track['ordered_qty'] : null,
+                'received_qty' => $track ? (float) $track['received_qty'] : null,
+                'is_manual'    => false,
+            ];
+        }, $rows);
+
+        // Append manual items
+        foreach ($manualRows as $m) {
+            $ingredients[] = [
+                'item_id'      => (int) $m['item_id'],
+                'item_name'    => $m['item_name'],
+                'item_code'    => $m['item_code'],
+                'uom'          => $m['uom'],
+                'group_code'   => $m['group_code'],
+                'total_qty'    => round((float) $m['projected_qty'], 3),
+                'dish_count'   => 0,
+                'stock_qty'    => (float) $m['stock_qty'],
+                'ordered_qty'  => $m['ordered_qty'] !== null ? (float) $m['ordered_qty'] : null,
+                'received_qty' => $m['received_qty'] !== null ? (float) $m['received_qty'] : null,
+                'is_manual'    => true,
+            ];
+        }
+
         jsonResponse([
             'week_start' => $weekStart,
             'week_end' => $weekEnd,
-            'ingredients' => array_map(function ($r) {
-                return [
-                    'item_id'    => (int) $r['item_id'],
-                    'item_name'  => $r['item_name'],
-                    'item_code'  => $r['item_code'],
-                    'uom'        => $r['uom'],
-                    'group_code' => $r['group_code'],
-                    'total_qty'  => round((float) $r['total_qty'], 3),
-                    'dish_count' => (int) $r['dish_count'],
-                    'stock_qty'  => (float) $r['stock_qty'],
-                ];
-            }, $rows),
+            'ingredients' => $ingredients,
         ]);
         exit;
     }
@@ -705,6 +768,89 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         exit;
     }
 
+    // ── Update Daily Tracking (ordered/received/consumed) ──
+    if ($action === 'update_daily_tracking') {
+        $ingId = (int) ($input['ingredient_id'] ?? 0);
+        if (!$ingId) jsonError('ingredient_id required', 400);
+
+        $ing = getIngredient($pdo, $ingId, $queryCampId);
+
+        $updates = [];
+        $params = [];
+        foreach (['ordered_qty', 'received_qty', 'consumed_qty'] as $field) {
+            if (array_key_exists($field, $input)) {
+                $updates[] = "{$field} = ?";
+                $params[] = $input[$field] !== null ? (float) $input[$field] : null;
+            }
+        }
+        if (empty($updates)) jsonError('At least one of ordered_qty, received_qty, consumed_qty required', 400);
+
+        $params[] = $ingId;
+        $pdo->prepare("UPDATE kitchen_menu_ingredients SET " . implode(', ', $updates) . ", updated_at = NOW() WHERE id = ?")->execute($params);
+
+        jsonResponse(['message' => 'Daily tracking updated']);
+        exit;
+    }
+
+    // ── Update Weekly Grocery (ordered/received) ──
+    if ($action === 'update_weekly_grocery') {
+        $weekStart = $input['week_start'] ?? '';
+        $itemId = (int) ($input['item_id'] ?? 0);
+        if (!$weekStart || !$itemId) jsonError('week_start and item_id required', 400);
+
+        $updates = [];
+        $params = [];
+        foreach (['ordered_qty', 'received_qty'] as $field) {
+            if (array_key_exists($field, $input)) {
+                $updates[] = "{$field} = ?";
+                $params[] = $input[$field] !== null ? (float) $input[$field] : null;
+            }
+        }
+        if (empty($updates)) jsonError('At least one of ordered_qty, received_qty required', 400);
+
+        // Check if row exists
+        $check = $pdo->prepare("SELECT id FROM kitchen_weekly_groceries WHERE camp_id = ? AND week_start = ? AND item_id = ?");
+        $check->execute([$queryCampId, $weekStart, $itemId]);
+        $existing = $check->fetch();
+
+        if ($existing) {
+            $params[] = $existing['id'];
+            $pdo->prepare("UPDATE kitchen_weekly_groceries SET " . implode(', ', $updates) . ", updated_at = NOW() WHERE id = ?")->execute($params);
+        } else {
+            // Auto-create row with projected_qty = 0 if doesn't exist
+            $orderedQty = $input['ordered_qty'] ?? null;
+            $receivedQty = $input['received_qty'] ?? null;
+            $pdo->prepare("
+                INSERT INTO kitchen_weekly_groceries (camp_id, week_start, item_id, projected_qty, ordered_qty, received_qty, added_by, created_at)
+                VALUES (?, ?, ?, 0, ?, ?, ?, NOW())
+            ")->execute([$queryCampId, $weekStart, $itemId, $orderedQty, $receivedQty, $userId]);
+        }
+
+        jsonResponse(['message' => 'Weekly grocery updated']);
+        exit;
+    }
+
+    // ── Add Weekly Grocery (manual item) ──
+    if ($action === 'add_weekly_grocery') {
+        $weekStart = $input['week_start'] ?? '';
+        $itemId = (int) ($input['item_id'] ?? 0);
+        $projectedQty = (float) ($input['projected_qty'] ?? 0);
+        if (!$weekStart || !$itemId) jsonError('week_start and item_id required', 400);
+
+        // Check if already exists
+        $check = $pdo->prepare("SELECT id FROM kitchen_weekly_groceries WHERE camp_id = ? AND week_start = ? AND item_id = ?");
+        $check->execute([$queryCampId, $weekStart, $itemId]);
+        if ($check->fetch()) jsonError('Item already in weekly groceries', 409);
+
+        $pdo->prepare("
+            INSERT INTO kitchen_weekly_groceries (camp_id, week_start, item_id, projected_qty, added_by, created_at)
+            VALUES (?, ?, ?, ?, ?, NOW())
+        ")->execute([$queryCampId, $weekStart, $itemId, $projectedQty, $userId]);
+
+        jsonResponse(['message' => 'Weekly grocery item added', 'id' => (int) $pdo->lastInsertId()], 201);
+        exit;
+    }
+
     // ── Reopen Plan ──
     if ($action === 'reopen_plan') {
         $planId = (int) ($input['plan_id'] ?? 0);
@@ -863,6 +1009,9 @@ function getFullPlanDishes(PDO $pdo, int $planId, int $campId): array {
                     'uom'           => $ing['uom'],
                     'source'        => $ing['source'],
                     'is_primary'    => (bool) ($ing['is_primary'] ?? 0),
+                    'ordered_qty'   => $ing['ordered_qty'] !== null ? (float) $ing['ordered_qty'] : null,
+                    'received_qty'  => $ing['received_qty'] !== null ? (float) $ing['received_qty'] : null,
+                    'consumed_qty'  => $ing['consumed_qty'] !== null ? (float) $ing['consumed_qty'] : null,
                     'is_removed'    => (bool) $ing['is_removed'],
                     'removed_reason' => $ing['removed_reason'],
                     'ai_reason'     => $ing['ai_reason'],
