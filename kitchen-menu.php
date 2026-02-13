@@ -20,7 +20,8 @@
  * POST ?action=add_ingredient     — manually add an ingredient to a dish
  * POST ?action=remove_ingredient  — remove/mark ingredient as removed
  * POST ?action=update_qty         — update ingredient quantity
- * POST ?action=update_portions    — update portions count (recalcs quantities)
+ * POST ?action=update_portions    — update portions count per dish (recalcs quantities)
+ * POST ?action=update_plan_pax    — update total pax (covers) for a meal plan
  * POST ?action=confirm_plan       — lock menu plan as confirmed
  * POST ?action=reopen_plan        — reopen a confirmed plan for edits
  * POST ?action=rate_presentation  — AI scores dish photo presentation
@@ -771,6 +772,30 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         ]);
 
         jsonResponse(['message' => "Portions updated from {$oldPortions} to {$newPortions}"]);
+        exit;
+    }
+
+    // ── Update Plan Pax (total covers for the meal) ──
+    if ($action === 'update_plan_pax') {
+        $planId = (int) ($input['plan_id'] ?? 0);
+        $pax    = (int) ($input['pax'] ?? 0);
+        if (!$planId || $pax < 1) jsonError('plan_id and pax (>0) required', 400);
+
+        $plan = getPlanForEdit($pdo, $planId, $queryCampId);
+        $oldPax = (int) $plan['portions'];
+
+        $pdo->prepare("
+            UPDATE kitchen_menu_plans SET portions = ?, updated_at = NOW()
+            WHERE id = ?
+        ")->execute([$pax, $planId]);
+
+        auditLog($pdo, $planId, null, null, $userId, 'update_plan_pax', [
+            'pax' => $oldPax,
+        ], [
+            'pax' => $pax,
+        ]);
+
+        jsonResponse(['message' => "Plan pax updated from {$oldPax} to {$pax}"]);
         exit;
     }
 
