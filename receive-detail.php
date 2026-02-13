@@ -123,9 +123,69 @@ if ($_SERVER['REQUEST_METHOD'] === 'PUT') {
 
     $campId = (int) $receipt['camp_id'];
 
+    // ── Batch-fetch all receipt lines + item costs upfront (eliminates N+1) ──
+    $lineIds = array_filter(array_map(function($l) {
+        return !empty($l['line_id']) ? (int) $l['line_id'] : null;
+    }, $input['lines']));
+    $lineIds = array_values(array_unique($lineIds));
+
+    $linesMap = [];
+    $itemCostMap = [];
+
+    if (count($lineIds) > 0) {
+        $ph = implode(',', array_fill(0, count($lineIds), '?'));
+
+        // Batch: receipt lines
+        $rlStmt = $pdo->prepare("SELECT * FROM receipt_lines WHERE id IN ({$ph}) AND receipt_id = ?");
+        $rlStmt->execute(array_merge($lineIds, [$id]));
+        $allItemIds = [];
+        foreach ($rlStmt->fetchAll() as $row) {
+            $linesMap[(int) $row['id']] = $row;
+            $allItemIds[] = (int) $row['item_id'];
+        }
+        $allItemIds = array_values(array_unique($allItemIds));
+
+        // Batch: item costs
+        if (count($allItemIds) > 0) {
+            $ph2 = implode(',', array_fill(0, count($allItemIds), '?'));
+            $icStmt = $pdo->prepare("SELECT id, weighted_avg_cost, last_purchase_price FROM items WHERE id IN ({$ph2})");
+            $icStmt->execute($allItemIds);
+            foreach ($icStmt->fetchAll() as $row) {
+                $itemCostMap[(int) $row['id']] = $row;
+            }
+        }
+    }
+
     $pdo->beginTransaction();
     try {
         $totalValue = 0;
+
+        $updateLineStmt = $pdo->prepare("
+            UPDATE receipt_lines
+            SET received_qty = ?, accepted_qty = ?, rejected_qty = ?,
+                rejection_reason = ?, quality_notes = ?, is_received = 1
+            WHERE id = ?
+        ");
+
+        // Use INSERT ... ON DUPLICATE KEY UPDATE instead of SELECT+check+INSERT/UPDATE
+        $upsertStockStmt = $pdo->prepare("
+            INSERT INTO stock_balances (camp_id, item_id, current_qty, current_value, unit_cost, last_receipt_date, updated_at)
+            VALUES (?, ?, ?, ?, ?, CURDATE(), NOW())
+            ON DUPLICATE KEY UPDATE
+                current_qty = current_qty + VALUES(current_qty),
+                current_value = current_value + VALUES(current_value),
+                last_receipt_date = CURDATE(),
+                updated_at = NOW()
+        ");
+
+        $balStmt = $pdo->prepare("SELECT current_qty FROM stock_balances WHERE camp_id = ? AND item_id = ?");
+
+        $mvStmt = $pdo->prepare("
+            INSERT INTO stock_movements (item_id, camp_id, movement_type, direction, quantity,
+                unit_cost, total_value, balance_after,
+                reference_type, reference_id, created_by, movement_date, created_at)
+            VALUES (?, ?, 'received', 'in', ?, ?, ?, ?, 'receipt', ?, ?, CURDATE(), NOW())
+        ");
 
         foreach ($input['lines'] as $lineInput) {
             if (empty($lineInput['line_id'])) continue;
@@ -137,64 +197,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'PUT') {
             $rejectionReason = $lineInput['rejection_reason'] ?? null;
             $qualityNotes = $lineInput['quality_notes'] ?? null;
 
-            // Get line details
-            $line = $pdo->prepare("SELECT * FROM receipt_lines WHERE id = ? AND receipt_id = ?");
-            $line->execute([$lineId, $id]);
-            $line = $line->fetch();
+            $line = $linesMap[$lineId] ?? null;
             if (!$line) continue;
 
             $itemId = (int) $line['item_id'];
-
-            // Get unit cost from item
-            $itemData = $pdo->prepare("SELECT weighted_avg_cost, last_purchase_price FROM items WHERE id = ?");
-            $itemData->execute([$itemId]);
-            $itemData = $itemData->fetch();
+            $itemData = $itemCostMap[$itemId] ?? null;
             $unitCost = $itemData ? ((float)($itemData['weighted_avg_cost'] ?: $itemData['last_purchase_price'] ?: 0)) : 0;
             $lineValue = $acceptedQty * $unitCost;
             $totalValue += $lineValue;
 
-            // Update receipt line
-            $pdo->prepare("
-                UPDATE receipt_lines
-                SET received_qty = ?, accepted_qty = ?, rejected_qty = ?,
-                    rejection_reason = ?, quality_notes = ?, is_received = 1
-                WHERE id = ?
-            ")->execute([$receivedQty, $acceptedQty, $rejectedQty, $rejectionReason, $qualityNotes, $lineId]);
+            $updateLineStmt->execute([$receivedQty, $acceptedQty, $rejectedQty, $rejectionReason, $qualityNotes, $lineId]);
 
-            // Add to stock balance (only accepted qty)
             if ($acceptedQty > 0) {
-                $existingStock = $pdo->prepare("SELECT id FROM stock_balances WHERE camp_id = ? AND item_id = ?");
-                $existingStock->execute([$campId, $itemId]);
+                $upsertStockStmt->execute([$campId, $itemId, $acceptedQty, $lineValue, $unitCost]);
 
-                if ($existingStock->fetch()) {
-                    $pdo->prepare("
-                        UPDATE stock_balances
-                        SET current_qty = current_qty + ?,
-                            current_value = current_value + ?,
-                            last_receipt_date = CURDATE(),
-                            updated_at = NOW()
-                        WHERE camp_id = ? AND item_id = ?
-                    ")->execute([$acceptedQty, $lineValue, $campId, $itemId]);
-                } else {
-                    $pdo->prepare("
-                        INSERT INTO stock_balances (camp_id, item_id, current_qty, current_value, unit_cost,
-                            last_receipt_date, updated_at)
-                        VALUES (?, ?, ?, ?, ?, CURDATE(), NOW())
-                    ")->execute([$campId, $itemId, $acceptedQty, $lineValue, $unitCost]);
-                }
-
-                // Get new balance for stock movement
-                $balStmt = $pdo->prepare("SELECT current_qty FROM stock_balances WHERE camp_id = ? AND item_id = ?");
                 $balStmt->execute([$campId, $itemId]);
                 $newBalance = (float) $balStmt->fetchColumn();
 
-                // Create stock movement
-                $pdo->prepare("
-                    INSERT INTO stock_movements (item_id, camp_id, movement_type, direction, quantity,
-                        unit_cost, total_value, balance_after,
-                        reference_type, reference_id, created_by, movement_date, created_at)
-                    VALUES (?, ?, 'received', 'in', ?, ?, ?, ?, 'receipt', ?, ?, CURDATE(), NOW())
-                ")->execute([$itemId, $campId, $acceptedQty, $unitCost, $lineValue, $newBalance, $id, $auth['user_id']]);
+                $mvStmt->execute([$itemId, $campId, $acceptedQty, $unitCost, $lineValue, $newBalance, $id, $auth['user_id']]);
             }
         }
 

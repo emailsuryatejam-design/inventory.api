@@ -2,6 +2,7 @@
 /**
  * KCL Stores — Dashboard Stats
  * GET /api/dashboard.php?camp_id=1
+ * Optimized: single query for all counts (was 6 separate queries)
  */
 
 require_once __DIR__ . '/middleware.php';
@@ -10,58 +11,26 @@ $auth = requireAuth();
 
 $pdo = getDB();
 $campId = (int) ($_GET['camp_id'] ?? $auth['camp_id'] ?? 0);
-
-$campFilter = $campId ? 'AND camp_id = ?' : '';
-$campParams = $campId ? [$campId] : [];
-
-// Pending orders (submitted, pending_review)
-$stmt = $pdo->prepare("
-    SELECT COUNT(*) FROM orders
-    WHERE status IN ('submitted', 'pending_review') {$campFilter}
-");
-$stmt->execute($campParams);
-$pendingOrders = (int) $stmt->fetchColumn();
-
-// Low stock items
-$stmt = $pdo->prepare("
-    SELECT COUNT(*) FROM stock_balances
-    WHERE stock_status IN ('low', 'critical', 'out')
-    " . ($campId ? 'AND camp_id = ?' : '') . "
-");
-$stmt->execute($campParams);
-$lowStockItems = (int) $stmt->fetchColumn();
-
-// Pending receipts (dispatched but not received)
-$stmt = $pdo->prepare("
-    SELECT COUNT(*) FROM dispatches
-    WHERE status IN ('dispatched', 'in_transit')
-    " . ($campId ? 'AND camp_id = ?' : '') . "
-");
-$stmt->execute($campParams);
-$pendingReceipts = (int) $stmt->fetchColumn();
-
-// Issues today
 $today = date('Y-m-d');
-$stmt = $pdo->prepare("
-    SELECT COUNT(*) FROM issue_vouchers
-    WHERE DATE(issue_date) = ?
-    " . ($campId ? 'AND camp_id = ?' : '') . "
-");
-$issueParams = [$today];
-if ($campId) $issueParams[] = $campId;
-$stmt->execute($issueParams);
-$issuesToday = (int) $stmt->fetchColumn();
 
-// Total stock value
-$stmt = $pdo->prepare("
-    SELECT COALESCE(SUM(current_value), 0) FROM stock_balances
-    " . ($campId ? 'WHERE camp_id = ?' : '') . "
-");
-$stmt->execute($campParams);
-$totalStockValue = (float) $stmt->fetchColumn();
+// ── Single query for all counts ──
+$countsSql = "
+    SELECT
+        (SELECT COUNT(*) FROM orders WHERE status IN ('submitted', 'pending_review')
+            " . ($campId ? "AND camp_id = {$campId}" : '') . ") as pending_orders,
+        (SELECT COUNT(*) FROM stock_balances WHERE stock_status IN ('low', 'critical', 'out')
+            " . ($campId ? "AND camp_id = {$campId}" : '') . ") as low_stock_items,
+        (SELECT COUNT(*) FROM dispatches WHERE status IN ('dispatched', 'in_transit')
+            " . ($campId ? "AND camp_id = {$campId}" : '') . ") as pending_receipts,
+        (SELECT COUNT(*) FROM issue_vouchers WHERE DATE(issue_date) = '{$today}'
+            " . ($campId ? "AND camp_id = {$campId}" : '') . ") as issues_today,
+        (SELECT COALESCE(SUM(current_value), 0) FROM stock_balances
+            " . ($campId ? "WHERE camp_id = {$campId}" : '') . ") as total_stock_value,
+        (SELECT COUNT(*) FROM items WHERE is_active = 1) as items_count
+";
+$counts = $pdo->query($countsSql)->fetch();
 
-// Items count
-$itemsCount = (int) $pdo->query('SELECT COUNT(*) FROM items WHERE is_active = 1')->fetchColumn();
+$campParams = $campId ? [$campId] : [];
 
 // Recent orders (last 5)
 $recentOrdersSql = "
@@ -91,7 +60,9 @@ $lowStockSql = "
     LEFT JOIN units_of_measure u ON i.stock_uom_id = u.id
     WHERE sb.stock_status IN ('low', 'critical', 'out')
     " . ($campId ? 'AND sb.camp_id = ?' : '') . "
-    ORDER BY FIELD(sb.stock_status, 'out', 'critical', 'low')
+    ORDER BY
+        CASE sb.stock_status WHEN 'out' THEN 1 WHEN 'critical' THEN 2 WHEN 'low' THEN 3 END,
+        sb.current_qty ASC
     LIMIT 10
 ";
 $stmt = $pdo->prepare($lowStockSql);
@@ -99,12 +70,12 @@ $stmt->execute($campParams);
 $lowStockAlerts = $stmt->fetchAll();
 
 jsonResponse([
-    'pending_orders' => $pendingOrders,
-    'low_stock_items' => $lowStockItems,
-    'pending_receipts' => $pendingReceipts,
-    'issues_today' => $issuesToday,
-    'total_stock_value' => $totalStockValue,
-    'items_count' => $itemsCount,
+    'pending_orders' => (int) $counts['pending_orders'],
+    'low_stock_items' => (int) $counts['low_stock_items'],
+    'pending_receipts' => (int) $counts['pending_receipts'],
+    'issues_today' => (int) $counts['issues_today'],
+    'total_stock_value' => (float) $counts['total_stock_value'],
+    'items_count' => (int) $counts['items_count'],
     'recent_orders' => array_map(function($o) {
         return [
             'id' => (int) $o['id'],

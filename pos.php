@@ -243,8 +243,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $costCenterId = $pdo->query("SELECT id FROM cost_centers WHERE is_active = 1 ORDER BY id LIMIT 1")->fetchColumn();
     }
 
-    $campCode = $pdo->query("SELECT code FROM camps WHERE id = {$campId}")->fetchColumn();
+    $ccStmt2 = $pdo->prepare("SELECT code FROM camps WHERE id = ?");
+    $ccStmt2->execute([$campId]);
+    $campCode = $ccStmt2->fetchColumn();
     $voucherNumber = generateDocNumber($pdo, 'POS', $campCode);
+
+    // ── Batch-fetch all item costs upfront (eliminates N+1) ──
+    $itemIds = array_filter(array_map(function($i) {
+        return (!empty($i['id']) && !empty($i['qty']) && $i['qty'] > 0) ? (int) $i['id'] : null;
+    }, $input['items']));
+    $itemIds = array_values(array_unique($itemIds));
+
+    $itemCostMap = [];
+    if (count($itemIds) > 0) {
+        $ph = implode(',', array_fill(0, count($itemIds), '?'));
+        $icStmt = $pdo->prepare("SELECT id, weighted_avg_cost, last_purchase_price FROM items WHERE id IN ({$ph})");
+        $icStmt->execute($itemIds);
+        foreach ($icStmt->fetchAll() as $row) {
+            $itemCostMap[(int) $row['id']] = $row;
+        }
+    }
+
+    // Movement type
+    $mvType = 'issue_other';
+    if (in_array($serviceType, ['bar', 'kitchen', 'restaurant'])) $mvType = 'issue_kitchen';
+    elseif (in_array($serviceType, ['rooms', 'housekeeping'])) $mvType = 'issue_rooms';
+    elseif ($serviceType === 'staff') $mvType = 'issue_employee';
 
     $pdo->beginTransaction();
     try {
@@ -270,49 +294,41 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             VALUES (?, ?, ?, ?, ?, ?)
         ");
 
+        $deductStmt = $pdo->prepare("
+            UPDATE stock_balances
+            SET current_qty = GREATEST(0, current_qty - ?),
+                current_value = GREATEST(0, current_value - ?),
+                last_issue_date = CURDATE(),
+                updated_at = NOW()
+            WHERE camp_id = ? AND item_id = ?
+        ");
+
+        $balStmt = $pdo->prepare("SELECT current_qty FROM stock_balances WHERE camp_id = ? AND item_id = ?");
+
+        $mvStmt = $pdo->prepare("
+            INSERT INTO stock_movements (item_id, camp_id, movement_type, direction, quantity, unit_cost, total_value,
+                balance_after, reference_type, reference_id, cost_center_id, created_by, movement_date, created_at)
+            VALUES (?, ?, ?, 'out', ?, ?, ?, ?, 'issue_voucher', ?, ?, ?, CURDATE(), NOW())
+        ");
+
         foreach ($input['items'] as $item) {
             if (empty($item['id']) || empty($item['qty']) || $item['qty'] <= 0) continue;
 
             $itemId = (int) $item['id'];
             $qty = (float) $item['qty'];
 
-            // Get item cost
-            $itemData = $pdo->query("SELECT weighted_avg_cost, last_purchase_price FROM items WHERE id = {$itemId}")->fetch();
+            $itemData = $itemCostMap[$itemId] ?? null;
             $unitCost = $itemData ? ((float) ($itemData['weighted_avg_cost'] ?: $itemData['last_purchase_price'])) : 0;
             $lineValue = $qty * $unitCost;
             $totalValue += $lineValue;
 
-            $lineStmt->execute([
-                $voucherId, $itemId, $qty, $unitCost, $lineValue, $item['notes'] ?? null,
-            ]);
+            $lineStmt->execute([$voucherId, $itemId, $qty, $unitCost, $lineValue, $item['notes'] ?? null]);
+            $deductStmt->execute([$qty, $lineValue, $campId, $itemId]);
 
-            // Deduct stock
-            $pdo->prepare("
-                UPDATE stock_balances
-                SET current_qty = GREATEST(0, current_qty - ?),
-                    current_value = GREATEST(0, current_value - ?),
-                    last_issue_date = CURDATE(),
-                    updated_at = NOW()
-                WHERE camp_id = ? AND item_id = ?
-            ")->execute([$qty, $lineValue, $campId, $itemId]);
-
-            // Get balance after
-            $balStmt = $pdo->prepare("SELECT current_qty FROM stock_balances WHERE camp_id = ? AND item_id = ?");
             $balStmt->execute([$campId, $itemId]);
             $balAfter = (float) ($balStmt->fetchColumn() ?: 0);
 
-            // Movement type
-            $mvType = 'issue_other';
-            if (in_array($serviceType, ['bar', 'kitchen', 'restaurant'])) $mvType = 'issue_kitchen';
-            elseif (in_array($serviceType, ['rooms', 'housekeeping'])) $mvType = 'issue_rooms';
-            elseif ($serviceType === 'staff') $mvType = 'issue_employee';
-
-            // Stock movement record
-            $pdo->prepare("
-                INSERT INTO stock_movements (item_id, camp_id, movement_type, direction, quantity, unit_cost, total_value,
-                    balance_after, reference_type, reference_id, cost_center_id, created_by, movement_date, created_at)
-                VALUES (?, ?, ?, 'out', ?, ?, ?, ?, 'issue_voucher', ?, ?, ?, CURDATE(), NOW())
-            ")->execute([$itemId, $campId, $mvType, $qty, $unitCost, $lineValue, $balAfter,
+            $mvStmt->execute([$itemId, $campId, $mvType, $qty, $unitCost, $lineValue, $balAfter,
                          $voucherId, (int) $costCenterId, $auth['user_id']]);
         }
 

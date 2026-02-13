@@ -70,14 +70,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
     $stmt->execute($params);
     $orders = $stmt->fetchAll();
 
-    // Status counts
-    $countSql = "
-        SELECT status, COUNT(*) as cnt FROM orders
-        " . (in_array($auth['role'], ['camp_storekeeper', 'camp_manager']) && $auth['camp_id']
-            ? "WHERE camp_id = {$auth['camp_id']}" : '') . "
-        GROUP BY status
-    ";
-    $statusCounts = $pdo->query($countSql)->fetchAll(PDO::FETCH_KEY_PAIR);
+    // Status counts (parameterized)
+    $countWhere = '';
+    $countParams = [];
+    if (in_array($auth['role'], ['camp_storekeeper', 'camp_manager']) && $auth['camp_id']) {
+        $countWhere = 'WHERE camp_id = ?';
+        $countParams = [$auth['camp_id']];
+    }
+    $countStmt2 = $pdo->prepare("SELECT status, COUNT(*) as cnt FROM orders {$countWhere} GROUP BY status");
+    $countStmt2->execute($countParams);
+    $statusCounts = $countStmt2->fetchAll(PDO::FETCH_KEY_PAIR);
 
     jsonResponse([
         'orders' => array_map(function($o) {
@@ -126,8 +128,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         jsonError('You must be assigned to a camp to create orders', 400);
     }
 
-    // Get camp code
-    $campCode = $pdo->query("SELECT code FROM camps WHERE id = {$campId}")->fetchColumn();
+    // Get camp code (parameterized)
+    $campCodeStmt = $pdo->prepare("SELECT code FROM camps WHERE id = ?");
+    $campCodeStmt->execute([$campId]);
+    $campCode = $campCodeStmt->fetchColumn();
     if (!$campCode) {
         jsonError('Camp not found', 400);
     }
@@ -137,6 +141,41 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     // Generate order number
     $orderNumber = generateDocNumber($pdo, 'ORD', $campCode);
+
+    // ── Batch-fetch all item data + stock upfront (eliminates N+1) ──
+    $itemIds = array_filter(array_map(function($l) {
+        return (!empty($l['item_id']) && !empty($l['qty']) && $l['qty'] > 0) ? (int) $l['item_id'] : null;
+    }, $input['lines']));
+    $itemIds = array_values(array_unique($itemIds));
+
+    $itemsMap = [];
+    $campStockMap = [];
+    $hoStockMap = [];
+
+    if (count($itemIds) > 0) {
+        $placeholders = implode(',', array_fill(0, count($itemIds), '?'));
+
+        // Batch: items
+        $itemStmt = $pdo->prepare("SELECT id, weighted_avg_cost, last_purchase_price FROM items WHERE id IN ({$placeholders}) AND is_active = 1");
+        $itemStmt->execute($itemIds);
+        foreach ($itemStmt->fetchAll() as $row) {
+            $itemsMap[(int) $row['id']] = $row;
+        }
+
+        // Batch: camp stock
+        $csStmt = $pdo->prepare("SELECT item_id, current_qty, par_level, avg_daily_usage FROM stock_balances WHERE item_id IN ({$placeholders}) AND camp_id = ?");
+        $csStmt->execute(array_merge($itemIds, [$campId]));
+        foreach ($csStmt->fetchAll() as $row) {
+            $campStockMap[(int) $row['item_id']] = $row;
+        }
+
+        // Batch: HO stock
+        $hsStmt = $pdo->prepare("SELECT item_id, current_qty FROM stock_balances WHERE item_id IN ({$placeholders}) AND camp_id = ?");
+        $hsStmt->execute(array_merge($itemIds, [$hoId]));
+        foreach ($hsStmt->fetchAll() as $row) {
+            $hoStockMap[(int) $row['item_id']] = (float) $row['current_qty'];
+        }
+    }
 
     $pdo->beginTransaction();
     try {
@@ -151,6 +190,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         // Process lines
         $totalValue = 0;
         $flaggedCount = 0;
+        $lineCount = 0;
         $lineStmt = $pdo->prepare("
             INSERT INTO order_lines (
                 order_id, item_id, requested_qty,
@@ -168,33 +208,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $itemId = (int) $line['item_id'];
             $qty = (float) $line['qty'];
 
-            // Get item info
-            $item = $pdo->prepare("SELECT id, weighted_avg_cost, last_purchase_price FROM items WHERE id = ? AND is_active = 1")
-                ->execute([$itemId]);
-            $item = $pdo->query("SELECT id, weighted_avg_cost, last_purchase_price FROM items WHERE id = {$itemId} AND is_active = 1")->fetch();
-
+            // Use batch-fetched data
+            $item = $itemsMap[$itemId] ?? null;
             if (!$item) continue;
 
             $unitCost = $item['weighted_avg_cost'] ?: $item['last_purchase_price'] ?: 0;
             $lineValue = $qty * $unitCost;
             $totalValue += $lineValue;
 
-            // Get camp stock
-            $campStockStmt = $pdo->prepare("SELECT current_qty, par_level, avg_daily_usage FROM stock_balances WHERE item_id = ? AND camp_id = ?");
-            $campStockStmt->execute([$itemId, $campId]);
-            $campStockRow = $campStockStmt->fetch();
+            $campStockRow = $campStockMap[$itemId] ?? null;
             $campStock = $campStockRow ? (float) $campStockRow['current_qty'] : 0;
             $parLevel = $campStockRow ? ($campStockRow['par_level'] ? (float) $campStockRow['par_level'] : null) : null;
             $avgUsage = $campStockRow ? ($campStockRow['avg_daily_usage'] ? (float) $campStockRow['avg_daily_usage'] : null) : null;
 
-            // Get HO stock
-            $hoStockStmt = $pdo->prepare("SELECT current_qty FROM stock_balances WHERE item_id = ? AND camp_id = ?");
-            $hoStockStmt->execute([$itemId, $hoId]);
-            $hoStock = (float) ($hoStockStmt->fetchColumn() ?: 0);
+            $hoStock = $hoStockMap[$itemId] ?? 0;
 
             // Validate
             $validation = validateOrderLine($line, $campStock, $hoStock, $parLevel, $avgUsage);
             if ($validation['status'] === 'flagged') $flaggedCount++;
+            $lineCount++;
 
             $lineStmt->execute([
                 $orderId, $itemId, $qty,
@@ -203,9 +235,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $validation['status'], $validation['note'],
             ]);
         }
-
-        // Update order totals
-        $lineCount = (int) $pdo->query("SELECT COUNT(*) FROM order_lines WHERE order_id = {$orderId}")->fetchColumn();
 
         $pdo->prepare("
             UPDATE orders SET total_items = ?, total_value = ?, flagged_items = ?, status = 'submitted', submitted_at = NOW()

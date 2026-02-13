@@ -152,6 +152,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $dispatchId = (int) $pdo->lastInsertId();
 
+        // Deduct from HO stock
+        $hoId = (int) $pdo->query("SELECT id FROM camps WHERE code = 'HO'")->fetchColumn();
+
+        // ── Batch-fetch all item costs upfront (eliminates N+1) ──
+        $itemIds = array_filter(array_map(function($l) {
+            return (!empty($l['item_id']) && !empty($l['qty']) && $l['qty'] > 0) ? (int) $l['item_id'] : null;
+        }, $input['lines']));
+        $itemIds = array_values(array_unique($itemIds));
+
+        $itemCostMap = [];
+        if (count($itemIds) > 0) {
+            $ph = implode(',', array_fill(0, count($itemIds), '?'));
+            $icStmt = $pdo->prepare("SELECT id, weighted_avg_cost, last_purchase_price FROM items WHERE id IN ({$ph})");
+            $icStmt->execute($itemIds);
+            foreach ($icStmt->fetchAll() as $row) {
+                $itemCostMap[(int) $row['id']] = $row;
+            }
+        }
+
         // Process lines
         $totalValue = 0;
         $lineCount = 0;
@@ -160,8 +179,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             VALUES (?, ?, ?, ?, ?)
         ");
 
-        // Deduct from HO stock
-        $hoId = (int) $pdo->query("SELECT id FROM camps WHERE code = 'HO'")->fetchColumn();
+        $deductStmt = $pdo->prepare("
+            UPDATE stock_balances SET current_qty = GREATEST(0, current_qty - ?), updated_at = NOW()
+            WHERE item_id = ? AND camp_id = ?
+        ");
+
+        $mvStmt = $pdo->prepare("
+            INSERT INTO stock_movements (item_id, camp_id, movement_type, direction, quantity, unit_cost, total_value,
+                balance_after, reference_type, reference_id, created_by, movement_date, created_at)
+            VALUES (?, ?, 'transfer_out', 'out', ?, ?, ?, 0, 'dispatch', ?, ?, CURDATE(), NOW())
+        ");
 
         foreach ($input['lines'] as $line) {
             if (empty($line['item_id']) || empty($line['qty']) || $line['qty'] <= 0) continue;
@@ -169,27 +196,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $itemId = (int) $line['item_id'];
             $qty = (float) $line['qty'];
 
-            // Get unit cost
-            $item = $pdo->query("SELECT weighted_avg_cost, last_purchase_price FROM items WHERE id = {$itemId}")->fetch();
+            $item = $itemCostMap[$itemId] ?? null;
             $unitCost = $item ? ($item['weighted_avg_cost'] ?: $item['last_purchase_price'] ?: 0) : 0;
             $lineValue = $qty * $unitCost;
             $totalValue += $lineValue;
             $lineCount++;
 
             $lineStmt->execute([$dispatchId, $itemId, $qty, $unitCost, $lineValue]);
-
-            // Deduct from HO stock
-            $pdo->prepare("
-                UPDATE stock_balances SET current_qty = GREATEST(0, current_qty - ?), updated_at = NOW()
-                WHERE item_id = ? AND camp_id = ?
-            ")->execute([$qty, $itemId, $hoId]);
-
-            // Stock movement: transfer_out from HO
-            $pdo->prepare("
-                INSERT INTO stock_movements (item_id, camp_id, movement_type, direction, quantity, unit_cost, total_value,
-                    balance_after, reference_type, reference_id, created_by, movement_date, created_at)
-                VALUES (?, ?, 'transfer_out', 'out', ?, ?, ?, 0, 'dispatch', ?, ?, CURDATE(), NOW())
-            ")->execute([$itemId, $hoId, $qty, $unitCost, $lineValue, $dispatchId, $user['user_id']]);
+            $deductStmt->execute([$qty, $itemId, $hoId]);
+            $mvStmt->execute([$itemId, $hoId, $qty, $unitCost, $lineValue, $dispatchId, $user['user_id']]);
         }
 
         // Update dispatch total

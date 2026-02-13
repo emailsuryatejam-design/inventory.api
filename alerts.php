@@ -31,60 +31,29 @@ if ($campId) {
 
 switch ($type) {
 
-    // ── Summary — counts for dashboard ──
+    // ── Summary — single query for all counts (was 6 separate queries) ──
     case 'summary':
-        // Low stock count
-        $lowStmt = $pdo->prepare("
-            SELECT COUNT(*) FROM stock_balances sb
-            WHERE sb.stock_status IN ('low', 'critical') {$campFilter}
+        $summaryStmt = $pdo->prepare("
+            SELECT
+                SUM(CASE WHEN sb.stock_status IN ('low', 'critical') THEN 1 ELSE 0 END) as low_count,
+                SUM(CASE WHEN sb.stock_status = 'out' THEN 1 ELSE 0 END) as out_count,
+                SUM(CASE WHEN sb.stock_status = 'critical' THEN 1 ELSE 0 END) as crit_count,
+                SUM(CASE WHEN sb.days_since_last_movement >= 60 AND sb.current_qty > 0 THEN 1 ELSE 0 END) as dead_count,
+                SUM(CASE WHEN sb.avg_daily_usage > 0 AND sb.current_qty > 0
+                    AND (sb.current_qty / sb.avg_daily_usage) <= 7 THEN 1 ELSE 0 END) as proj7_count,
+                SUM(CASE WHEN sb.stock_status = 'excess' THEN 1 ELSE 0 END) as excess_count
+            FROM stock_balances sb
+            WHERE 1=1 {$campFilter}
         ");
-        $lowStmt->execute($campParams);
-        $lowCount = (int) $lowStmt->fetchColumn();
+        $summaryStmt->execute($campParams);
+        $s = $summaryStmt->fetch();
 
-        // Out of stock
-        $outStmt = $pdo->prepare("
-            SELECT COUNT(*) FROM stock_balances sb
-            WHERE sb.stock_status = 'out' {$campFilter}
-        ");
-        $outStmt->execute($campParams);
-        $outCount = (int) $outStmt->fetchColumn();
-
-        // Critical (very low)
-        $critStmt = $pdo->prepare("
-            SELECT COUNT(*) FROM stock_balances sb
-            WHERE sb.stock_status = 'critical' {$campFilter}
-        ");
-        $critStmt->execute($campParams);
-        $critCount = (int) $critStmt->fetchColumn();
-
-        // Dead stock (no movement in 60+ days)
-        $deadStmt = $pdo->prepare("
-            SELECT COUNT(*) FROM stock_balances sb
-            WHERE sb.days_since_last_movement >= 60
-            AND sb.current_qty > 0
-            {$campFilter}
-        ");
-        $deadStmt->execute($campParams);
-        $deadCount = (int) $deadStmt->fetchColumn();
-
-        // Items projected to stock out in 7 days
-        $projStmt = $pdo->prepare("
-            SELECT COUNT(*) FROM stock_balances sb
-            WHERE sb.avg_daily_usage > 0
-            AND sb.current_qty > 0
-            AND (sb.current_qty / sb.avg_daily_usage) <= 7
-            {$campFilter}
-        ");
-        $projStmt->execute($campParams);
-        $proj7Count = (int) $projStmt->fetchColumn();
-
-        // Excess stock
-        $excessStmt = $pdo->prepare("
-            SELECT COUNT(*) FROM stock_balances sb
-            WHERE sb.stock_status = 'excess' {$campFilter}
-        ");
-        $excessStmt->execute($campParams);
-        $excessCount = (int) $excessStmt->fetchColumn();
+        $lowCount = (int) $s['low_count'];
+        $outCount = (int) $s['out_count'];
+        $critCount = (int) $s['crit_count'];
+        $deadCount = (int) $s['dead_count'];
+        $proj7Count = (int) $s['proj7_count'];
+        $excessCount = (int) $s['excess_count'];
 
         jsonResponse([
             'alerts' => [
@@ -118,7 +87,7 @@ switch ($type) {
             WHERE sb.stock_status IN ('low', 'critical', 'out')
             {$campFilter}
             ORDER BY
-                FIELD(sb.stock_status, 'out', 'critical', 'low'),
+                CASE sb.stock_status WHEN 'out' THEN 1 WHEN 'critical' THEN 2 WHEN 'low' THEN 3 END,
                 i.is_critical DESC,
                 sb.days_stock_on_hand ASC
             LIMIT 200

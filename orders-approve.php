@@ -20,9 +20,10 @@ requireFields($input, ['order_id', 'lines']);
 $pdo = getDB();
 $orderId = (int) $input['order_id'];
 
-// Get order
-$order = $pdo->prepare("SELECT * FROM orders WHERE id = ?")->execute([$orderId]);
-$order = $pdo->query("SELECT * FROM orders WHERE id = {$orderId}")->fetch();
+// Get order (parameterized)
+$orderStmt = $pdo->prepare("SELECT * FROM orders WHERE id = ?");
+$orderStmt->execute([$orderId]);
+$order = $orderStmt->fetch();
 
 if (!$order) jsonError('Order not found', 404);
 
@@ -35,6 +36,22 @@ try {
     $approvedCount = 0;
     $rejectedCount = 0;
     $adjustedCount = 0;
+
+    // Batch-fetch all requested quantities upfront (eliminates N+1)
+    $lineIds = array_filter(array_map(function($l) {
+        return (!empty($l['line_id']) && !empty($l['action'])) ? (int) $l['line_id'] : null;
+    }, $input['lines']));
+    $lineIds = array_values(array_unique($lineIds));
+
+    $reqQtyMap = [];
+    if (count($lineIds) > 0) {
+        $ph = implode(',', array_fill(0, count($lineIds), '?'));
+        $rqStmt = $pdo->prepare("SELECT id, requested_qty FROM order_lines WHERE id IN ({$ph}) AND order_id = ?");
+        $rqStmt->execute(array_merge($lineIds, [$orderId]));
+        foreach ($rqStmt->fetchAll() as $row) {
+            $reqQtyMap[(int) $row['id']] = (float) $row['requested_qty'];
+        }
+    }
 
     $updateStmt = $pdo->prepare("
         UPDATE order_lines SET stores_action = ?, approved_qty = ?, stores_note = ?, updated_at = NOW()
@@ -49,9 +66,7 @@ try {
         $note = $line['note'] ?? null;
 
         if ($action === 'approved') {
-            // Get the requested qty
-            $reqQty = $pdo->query("SELECT requested_qty FROM order_lines WHERE id = {$line['line_id']}")->fetchColumn();
-            $approvedQty = (float) $reqQty;
+            $approvedQty = $reqQtyMap[(int) $line['line_id']] ?? 0;
             $approvedCount++;
         } elseif ($action === 'adjusted') {
             $approvedQty = (float) ($line['approved_qty'] ?? 0);
@@ -64,8 +79,10 @@ try {
         $updateStmt->execute([$action, $approvedQty, $note, (int) $line['line_id'], $orderId]);
     }
 
-    // Determine overall status
-    $totalLines = (int) $pdo->query("SELECT COUNT(*) FROM order_lines WHERE order_id = {$orderId}")->fetchColumn();
+    // Determine overall status (parameterized)
+    $tlStmt = $pdo->prepare("SELECT COUNT(*) FROM order_lines WHERE order_id = ?");
+    $tlStmt->execute([$orderId]);
+    $totalLines = (int) $tlStmt->fetchColumn();
     $allRejected = $rejectedCount === $totalLines;
     $anyApproved = $approvedCount > 0 || $adjustedCount > 0;
 

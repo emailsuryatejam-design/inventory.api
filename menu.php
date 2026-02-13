@@ -250,7 +250,141 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
         exit;
     }
 
-    jsonError('Invalid action. Use: categories, items, item, stock_status, depletion', 400);
+    // ── Suggest alternative ingredients for out-of-stock items (Gemini AI) ──
+    if ($action === 'suggest_alternatives') {
+        $ingredient = $_GET['ingredient'] ?? '';
+        $drinkName = $_GET['drink'] ?? '';
+        if (!$ingredient) jsonError('Ingredient name required', 400);
+
+        // Get available stock items that could be alternatives
+        $availStmt = $pdo->prepare("
+            SELECT i.id, i.name, ig.name as group_name,
+                   COALESCE(sb.current_qty, 0) as stock_qty, u.code as uom
+            FROM items i
+            JOIN item_groups ig ON i.item_group_id = ig.id
+            LEFT JOIN units_of_measure u ON i.stock_uom_id = u.id
+            LEFT JOIN stock_balances sb ON sb.item_id = i.id AND sb.camp_id = ?
+            WHERE i.is_active = 1 AND ig.code IN ('BA','BJ','FV','FY','FD','GA')
+            AND COALESCE(sb.current_qty, 0) > 0
+            ORDER BY ig.code, i.name
+            LIMIT 80
+        ");
+        $availStmt->execute([$queryCampId]);
+        $available = $availStmt->fetchAll();
+
+        $stockList = [];
+        foreach ($available as $a) {
+            $stockList[] = $a['name'] . " ({$a['stock_qty']} {$a['uom']})";
+        }
+
+        $drinkContext = $drinkName ? " in the drink \"{$drinkName}\"" : '';
+        $prompt = "You are a professional safari lodge bartender. "
+            . "The ingredient \"{$ingredient}\"{$drinkContext} is out of stock. "
+            . "Suggest 3 alternative ingredients from this available stock that would work well as a substitute. "
+            . "For each alternative explain briefly why it works.\n\n"
+            . "Available stock:\n" . implode("\n", array_slice($stockList, 0, 60))
+            . "\n\nRespond in JSON format as an array of objects with keys: name (exact item name from list), reason (1 sentence why it works as substitute). Only return the JSON array.";
+
+        define('GEMINI_API_KEY_MENU', 'AIzaSyDso0Ae7zMkPuswSzrmPYfr9Q1KhQlls8c');
+        define('GEMINI_MODEL_MENU', 'gemini-2.0-flash');
+        $endpoint = 'https://generativelanguage.googleapis.com/v1beta/models/' . GEMINI_MODEL_MENU . ':generateContent?key=' . GEMINI_API_KEY_MENU;
+
+        $ch = curl_init($endpoint);
+        curl_setopt_array($ch, [
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => json_encode([
+                'contents' => [['parts' => [['text' => $prompt]]]],
+                'generationConfig' => ['temperature' => 0.7, 'maxOutputTokens' => 1024, 'responseMimeType' => 'application/json'],
+            ]),
+            CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT => 15,
+            CURLOPT_SSL_VERIFYPEER => true,
+        ]);
+        $resp = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        if ($httpCode !== 200) {
+            jsonResponse(['alternatives' => [], 'error' => 'AI service unavailable']);
+            exit;
+        }
+
+        $data = json_decode($resp, true);
+        $text = $data['candidates'][0]['content']['parts'][0]['text'] ?? '';
+        $alts = json_decode($text, true);
+        if (!$alts || !is_array($alts)) {
+            if (preg_match('/\[[\s\S]*\]/', $text, $m)) {
+                $alts = json_decode($m[0], true);
+            }
+        }
+
+        // Match alternative names back to actual stock item IDs
+        $result = [];
+        if (is_array($alts)) {
+            foreach ($alts as $alt) {
+                $altName = $alt['name'] ?? '';
+                // Find matching item
+                foreach ($available as $a) {
+                    if (stripos($a['name'], $altName) !== false || stripos($altName, $a['name']) !== false) {
+                        $result[] = [
+                            'item_id' => (int) $a['id'],
+                            'name' => $a['name'],
+                            'stock_qty' => (float) $a['stock_qty'],
+                            'uom' => $a['uom'],
+                            'reason' => $alt['reason'] ?? '',
+                        ];
+                        break;
+                    }
+                }
+            }
+        }
+
+        jsonResponse(['alternatives' => $result, 'ingredient' => $ingredient]);
+        exit;
+    }
+
+    // ── Search stock items (for adding custom ingredients) ──
+    if ($action === 'search_ingredients') {
+        $q = $_GET['q'] ?? '';
+        if (strlen($q) < 2) jsonError('Search query too short', 400);
+
+        $stmt = $pdo->prepare("
+            SELECT i.id, i.name, i.item_code, ig.name as group_name,
+                   COALESCE(sb.current_qty, 0) as stock_qty,
+                   u.code as uom,
+                   sb.stock_status
+            FROM items i
+            JOIN item_groups ig ON i.item_group_id = ig.id
+            LEFT JOIN units_of_measure u ON i.stock_uom_id = u.id
+            LEFT JOIN stock_balances sb ON sb.item_id = i.id AND sb.camp_id = ?
+            WHERE i.is_active = 1
+            AND ig.code IN ('BA','BJ','FV','FY','FD','GA')
+            AND (i.name LIKE ? OR i.item_code LIKE ?)
+            ORDER BY COALESCE(sb.current_qty, 0) DESC, i.name
+            LIMIT 20
+        ");
+        $search = "%{$q}%";
+        $stmt->execute([$queryCampId, $search, $search]);
+        $items = $stmt->fetchAll();
+
+        jsonResponse([
+            'items' => array_map(function($i) {
+                return [
+                    'id' => (int) $i['id'],
+                    'name' => $i['name'],
+                    'item_code' => $i['item_code'],
+                    'group_name' => $i['group_name'],
+                    'stock_qty' => (float) $i['stock_qty'],
+                    'uom' => $i['uom'],
+                    'stock_status' => $i['stock_status'],
+                ];
+            }, $items),
+        ]);
+        exit;
+    }
+
+    jsonError('Invalid action. Use: categories, items, item, stock_status, depletion, suggest_alternatives, search_ingredients', 400);
     exit;
 }
 
