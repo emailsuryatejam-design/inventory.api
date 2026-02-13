@@ -1097,6 +1097,34 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         exit;
     }
 
+    // ── Update Stock Balance (physical count from chef) ──
+    if ($action === 'update_stock') {
+        $itemId = (int) ($input['item_id'] ?? 0);
+        $qty = isset($input['qty']) ? (float) $input['qty'] : null;
+        if (!$itemId || $qty === null) jsonError('item_id and qty required', 400);
+        if ($qty < 0) $qty = 0;
+
+        // Upsert stock_balances
+        $check = $pdo->prepare("SELECT id FROM stock_balances WHERE camp_id = ? AND item_id = ?");
+        $check->execute([$queryCampId, $itemId]);
+        $existing = $check->fetch();
+
+        if ($existing) {
+            $pdo->prepare("
+                UPDATE stock_balances SET current_qty = ?, updated_at = NOW()
+                WHERE camp_id = ? AND item_id = ?
+            ")->execute([$qty, $queryCampId, $itemId]);
+        } else {
+            $pdo->prepare("
+                INSERT INTO stock_balances (camp_id, item_id, current_qty, current_value, unit_cost, updated_at)
+                VALUES (?, ?, ?, 0, 0, NOW())
+            ")->execute([$queryCampId, $itemId, $qty]);
+        }
+
+        jsonResponse(['message' => 'Stock updated', 'item_id' => $itemId, 'qty' => $qty]);
+        exit;
+    }
+
     // ── Add Weekly Grocery (manual item) ──
     if ($action === 'add_weekly_grocery') {
         $weekStart = $input['week_start'] ?? '';
