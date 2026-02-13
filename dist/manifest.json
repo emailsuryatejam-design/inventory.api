@@ -1,0 +1,17 @@
+{
+  "name": "KCL Stores",
+  "short_name": "KCL Stores",
+  "description": "Karibu Camps Inventory Management",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#16a34a",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "./favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}
