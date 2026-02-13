@@ -51,6 +51,29 @@ define('KITCHEN_GROUPS', "'FD','FM','FY','FV','FF','BA','BJ','GA','OT'");
 // Pantry staples — excluded when loading recipe ingredients into daily menu
 define('PANTRY_STAPLES', ['salt', 'black pepper', 'white pepper', 'pepper powder', 'cooking oil', 'olive oil', 'water', 'butter', 'vegetable oil']);
 
+// ── Fast File Cache ──────────────────────────────────
+// Write plan JSON to file so kitchen-fast.php can serve it without MySQL
+define('CACHE_DIR', __DIR__ . '/cache');
+
+function writePlanCache(int $campId, string $date, string $meal, array $data): void {
+    if (!is_dir(CACHE_DIR)) @mkdir(CACHE_DIR, 0755, true);
+    $file = CACHE_DIR . "/plan-{$campId}-{$date}-{$meal}.json";
+    @file_put_contents($file, json_encode($data, JSON_UNESCAPED_UNICODE), LOCK_EX);
+}
+
+function invalidatePlanCache(int $campId, string $date, string $meal): void {
+    $file = CACHE_DIR . "/plan-{$campId}-{$date}-{$meal}.json";
+    if (file_exists($file)) @unlink($file);
+}
+
+// Invalidate cache using plan_id (looks up date+meal from DB)
+function invalidatePlanCacheById(PDO $pdo, int $planId, int $campId): void {
+    $stmt = $pdo->prepare("SELECT plan_date, meal_type FROM kitchen_menu_plans WHERE id = ?");
+    $stmt->execute([$planId]);
+    $row = $stmt->fetch();
+    if ($row) invalidatePlanCache($campId, $row['plan_date'], $row['meal_type']);
+}
+
 
 // ════════════════════════════════════════════════════════════
 // GET ENDPOINTS
@@ -145,7 +168,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
         $recStmt->execute([$queryCampId ?: 0]);
         $recipes = $recStmt->fetchAll();
 
-        jsonResponse([
+        $responseData = [
             'plan' => $plan ? formatPlan($plan) : null,
             'dishes' => $dishes,
             'recipes' => array_map(function($r) {
@@ -159,7 +182,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
                     'ingredient_count' => (int) $r['ingredient_count'],
                 ];
             }, $recipes),
-        ]);
+        ];
+
+        // Write to file cache so kitchen-fast.php can serve it without MySQL
+        writePlanCache($queryCampId, $date, $meal, $responseData);
+
+        jsonResponse($responseData);
         exit;
     }
 
@@ -633,6 +661,33 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $input  = getJsonInput();
     $action = $input['action'] ?? '';
     $queryCampId = $campId ?: ((int) ($input['camp_id'] ?? 0));
+
+    // ── Invalidate file cache for any plan mutation ──
+    // If we have a plan_id, invalidate by plan. If we have date+meal, invalidate directly.
+    $cacheDate = $input['date'] ?? null;
+    $cacheMeal = $input['meal'] ?? null;
+    $cachePlanId = (int) ($input['plan_id'] ?? 0);
+    $cacheDishId = (int) ($input['dish_id'] ?? 0);
+    $cacheIngId  = (int) ($input['ingredient_id'] ?? 0);
+
+    // Resolve plan_id from dish_id or ingredient_id if needed
+    if (!$cachePlanId && $cacheDishId) {
+        $r = $pdo->prepare("SELECT menu_plan_id FROM kitchen_menu_dishes WHERE id = ?");
+        $r->execute([$cacheDishId]);
+        $cachePlanId = (int) ($r->fetchColumn() ?: 0);
+    }
+    if (!$cachePlanId && $cacheIngId) {
+        $r = $pdo->prepare("SELECT d.menu_plan_id FROM kitchen_menu_ingredients i JOIN kitchen_menu_dishes d ON i.dish_id = d.id WHERE i.id = ?");
+        $r->execute([$cacheIngId]);
+        $cachePlanId = (int) ($r->fetchColumn() ?: 0);
+    }
+
+    // Invalidate
+    if ($cachePlanId) {
+        invalidatePlanCacheById($pdo, $cachePlanId, $queryCampId);
+    } elseif ($cacheDate && $cacheMeal) {
+        invalidatePlanCache($queryCampId, $cacheDate, $cacheMeal);
+    }
 
     // ── Create Menu Plan ──
     if ($action === 'create_plan') {
