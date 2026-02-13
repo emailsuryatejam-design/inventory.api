@@ -132,9 +132,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
                     ]);
                     $newDishId = (int) $pdo->lastInsertId();
 
-                    // If recipe matched, load ingredients automatically
+                    // If recipe matched, load ingredients; otherwise carry forward from last occurrence
                     if ($tpl['recipe_id']) {
                         loadRecipeIntoDish($pdo, $newDishId, (int) $tpl['recipe_id'], 20, $newPlanId, $userId);
+                    } else {
+                        carryForwardIngredients($pdo, $newDishId, $tpl['dish_name'], $meal, $queryCampId, $newPlanId, $userId);
                     }
                 }
 
@@ -404,6 +406,38 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
         ");
         $manualStmt->execute([$queryCampId, $queryCampId, $weekStart, $queryCampId, $weekStart, $weekEnd]);
         $manualRows = $manualStmt->fetchAll();
+
+        // ── Weekly carry-forward: if no data at all, copy from most recent prior week ──
+        if (empty($rows) && empty($manualRows) && empty($trackingMap)) {
+            $prevWeekStmt = $pdo->prepare("
+                SELECT DISTINCT week_start
+                FROM kitchen_weekly_groceries
+                WHERE camp_id = ? AND week_start < ?
+                ORDER BY week_start DESC
+                LIMIT 1
+            ");
+            $prevWeekStmt->execute([$queryCampId, $weekStart]);
+            $prevWeek = $prevWeekStmt->fetchColumn();
+
+            if ($prevWeek) {
+                // Copy previous week's entries to current week
+                $pdo->prepare("
+                    INSERT IGNORE INTO kitchen_weekly_groceries (camp_id, week_start, item_id, projected_qty, added_by, created_at)
+                    SELECT camp_id, ?, item_id, projected_qty, ?, NOW()
+                    FROM kitchen_weekly_groceries
+                    WHERE camp_id = ? AND week_start = ?
+                ")->execute([$weekStart, $userId, $queryCampId, $prevWeek]);
+
+                // Re-fetch manual rows and tracking data with the carried-forward entries
+                $trackingStmt->execute([$queryCampId, $weekStart]);
+                $trackingMap = [];
+                foreach ($trackingStmt->fetchAll() as $t) {
+                    $trackingMap[(int) $t['item_id']] = $t;
+                }
+                $manualStmt->execute([$queryCampId, $queryCampId, $weekStart, $queryCampId, $weekStart, $weekEnd]);
+                $manualRows = $manualStmt->fetchAll();
+            }
+        }
 
         $ingredients = array_map(function ($r) use ($trackingMap) {
             $itemId = (int) $r['item_id'];
@@ -681,7 +715,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         // If it was recipe/ai_suggested and qty changed from original, mark as modified
         $newSource = $ing['source'];
-        if (in_array($ing['source'], ['ai_suggested', 'recipe']) && $ing['suggested_qty'] !== null && abs($newQty - (float) $ing['suggested_qty']) > 0.001) {
+        if (in_array($ing['source'], ['ai_suggested', 'recipe', 'carried_forward']) && $ing['suggested_qty'] !== null && abs($newQty - (float) $ing['suggested_qty']) > 0.001) {
             $newSource = 'modified';
         }
 
@@ -1145,6 +1179,51 @@ function loadRecipeIntoDish(PDO $pdo, int $dishId, int $recipeId, int $portions,
     }
 
     return ['added' => $added, 'recipe_name' => $recipe['name']];
+}
+
+/**
+ * Carry forward ingredients from the most recent prior occurrence of the same dish.
+ * Used when a default dish has no recipe_id — copies ingredients the chef added last time.
+ * Returns the count of ingredients carried forward (0 if no prior occurrence found).
+ */
+function carryForwardIngredients(PDO $pdo, int $newDishId, string $dishName, string $mealType, int $campId, int $planId, int $userId): int {
+    // Find most recent prior dish with same name + meal that has ingredients
+    $srcStmt = $pdo->prepare("
+        SELECT d.id, p.plan_date
+        FROM kitchen_menu_dishes d
+        JOIN kitchen_menu_plans p ON d.menu_plan_id = p.id
+        WHERE d.dish_name = ? AND p.meal_type = ? AND p.camp_id = ?
+          AND d.id != ?
+          AND EXISTS (SELECT 1 FROM kitchen_menu_ingredients mi WHERE mi.dish_id = d.id AND mi.is_removed = 0)
+        ORDER BY p.plan_date DESC
+        LIMIT 1
+    ");
+    $srcStmt->execute([$dishName, $mealType, $campId, $newDishId]);
+    $source = $srcStmt->fetch();
+
+    if (!$source) return 0;
+
+    $sourceDishId = (int) $source['id'];
+    $sourceDate = $source['plan_date'];
+
+    // Copy ingredients from source dish
+    $copyStmt = $pdo->prepare("
+        INSERT INTO kitchen_menu_ingredients (dish_id, item_id, suggested_qty, final_qty, uom, is_primary, source, ai_reason, created_at)
+        SELECT ?, mi.item_id, mi.final_qty, mi.final_qty, mi.uom, mi.is_primary,
+               'carried_forward', CONCAT('Carried from ', ?, ' ', ?), NOW()
+        FROM kitchen_menu_ingredients mi
+        WHERE mi.dish_id = ? AND mi.is_removed = 0
+    ");
+    $copyStmt->execute([$newDishId, $sourceDate, $mealType, $sourceDishId]);
+    $count = $copyStmt->rowCount();
+
+    if ($count > 0) {
+        auditLog($pdo, $planId, $newDishId, null, $userId, 'carry_forward_ingredients', null, [
+            'source_dish_id' => $sourceDishId, 'source_date' => $sourceDate, 'count' => $count,
+        ]);
+    }
+
+    return $count;
 }
 
 /**
