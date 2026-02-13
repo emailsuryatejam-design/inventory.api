@@ -568,6 +568,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         exit;
     }
 
+    // ── Delete Recipe (soft-delete) ──
+    if ($action === 'delete_recipe') {
+        requireRole(['chef', 'camp_manager', 'stores_manager', 'admin', 'director']);
+
+        $recipeId = (int) ($input['id'] ?? 0);
+        if (!$recipeId) jsonError('Recipe ID required', 400);
+
+        $recipe = $pdo->prepare("SELECT id, name FROM kitchen_recipes WHERE id = ? AND is_active = 1");
+        $recipe->execute([$recipeId]);
+        $r = $recipe->fetch();
+        if (!$r) jsonError('Recipe not found', 404);
+
+        $pdo->prepare("UPDATE kitchen_recipes SET is_active = 0, updated_at = NOW() WHERE id = ?")->execute([$recipeId]);
+
+        jsonResponse(['message' => 'Recipe deleted', 'recipe_id' => $recipeId]);
+        exit;
+    }
+
     // ── Trigger Preference Recomputation ──
     if ($action === 'learn') {
         recomputePreferences($pdo, $userId);

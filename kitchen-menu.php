@@ -5,19 +5,20 @@
  * GET  ?action=plan&date=YYYY-MM-DD&meal=lunch|dinner  — single menu plan with dishes + ingredients
  * GET  ?action=plans&month=YYYY-MM                     — all plans for a month
  * GET  ?action=audit&plan_id=X                         — audit trail for a plan
- * GET  ?action=suggest_ingredients&dish=X&portions=N   — AI suggests ingredients for a dish
+ * GET  ?action=recipe_ingredients&recipe_id=X&portions=N — recipe ingredients scaled to portions
  * GET  ?action=search_items&q=X                        — search kitchen stock items
  *
  * POST ?action=create_plan        — create a new menu plan (date + meal + portions)
- * POST ?action=add_dish           — add a dish to a plan
+ * POST ?action=add_dish           — add a dish to a plan (optionally linked to a recipe)
  * POST ?action=remove_dish        — remove a dish from a plan
- * POST ?action=accept_suggestions — accept AI-suggested ingredients for a dish
+ * POST ?action=load_recipe        — load recipe ingredients into a dish
  * POST ?action=add_ingredient     — manually add an ingredient to a dish
  * POST ?action=remove_ingredient  — remove/mark ingredient as removed
  * POST ?action=update_qty         — update ingredient quantity
  * POST ?action=update_portions    — update portions count (recalcs quantities)
  * POST ?action=confirm_plan       — lock menu plan as confirmed
  * POST ?action=reopen_plan        — reopen a confirmed plan for edits
+ * POST ?action=rate_presentation  — AI scores dish photo presentation
  */
 
 require_once __DIR__ . '/middleware.php';
@@ -36,10 +37,13 @@ if (!in_array($role, $allowedRoles)) {
     jsonError('Insufficient permissions for menu planning', 403);
 }
 
-// Gemini config (same key as kitchen.php)
+// Gemini config (only used for presentation scoring)
 define('GEMINI_KEY', 'AIzaSyDso0Ae7zMkPuswSzrmPYfr9Q1KhQlls8c');
 define('GEMINI_URL', 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=' . GEMINI_KEY);
 define('KITCHEN_GROUPS', "'FD','FM','FY','FV','FF','BA','BJ','GA','OT'");
+
+// Pantry staples — excluded when loading recipe ingredients into daily menu
+define('PANTRY_STAPLES', ['salt', 'black pepper', 'white pepper', 'pepper powder', 'cooking oil', 'olive oil', 'water', 'butter', 'vegetable oil']);
 
 
 // ════════════════════════════════════════════════════════════
@@ -146,75 +150,74 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
         exit;
     }
 
-    // ── AI Suggest Ingredients for a Dish ──
-    if ($action === 'suggest_ingredients') {
-        $dishName  = $_GET['dish'] ?? '';
-        $portions  = (int) ($_GET['portions'] ?? 20);
-        $course    = $_GET['course'] ?? '';
-        if (!$dishName) jsonError('dish name required', 400);
-        if ($portions < 1) $portions = 20;
+    // ── Get Recipe Ingredients (scaled to portions) ──
+    if ($action === 'recipe_ingredients') {
+        $recipeId = (int) ($_GET['recipe_id'] ?? 0);
+        $portions = (int) ($_GET['portions'] ?? 0);
+        if (!$recipeId) jsonError('recipe_id required', 400);
 
-        // Get available stock for context
-        $stmt = $pdo->prepare("
-            SELECT i.id, i.name, ig.name as group_name, ig.code as group_code,
-                   COALESCE(sb.current_qty, 0) as stock_qty, u.code as uom
-            FROM items i
+        // Get recipe
+        $recipeStmt = $pdo->prepare("SELECT * FROM kitchen_recipes WHERE id = ? AND is_active = 1");
+        $recipeStmt->execute([$recipeId]);
+        $recipe = $recipeStmt->fetch();
+        if (!$recipe) jsonError('Recipe not found', 404);
+
+        $recipeServes = max((int) $recipe['serves'], 1);
+        $targetPortions = $portions > 0 ? $portions : $recipeServes;
+        $ratio = $targetPortions / $recipeServes;
+
+        // Get ingredients with stock info, exclude pantry staples
+        $ingStmt = $pdo->prepare("
+            SELECT kri.*, i.name as item_name, i.item_code, u.code as uom,
+                   COALESCE(sb.current_qty, 0) as stock_qty, ig.code as group_code
+            FROM kitchen_recipe_ingredients kri
+            JOIN items i ON kri.item_id = i.id
             JOIN item_groups ig ON i.item_group_id = ig.id
             LEFT JOIN units_of_measure u ON i.stock_uom_id = u.id
             LEFT JOIN stock_balances sb ON sb.item_id = i.id AND sb.camp_id = ?
-            WHERE i.is_active = 1 AND ig.code IN (" . KITCHEN_GROUPS . ")
-            ORDER BY ig.code, i.name
+            WHERE kri.recipe_id = ?
+            ORDER BY kri.is_primary DESC, i.name
         ");
-        $stmt->execute([$queryCampId]);
-        $allItems = $stmt->fetchAll();
+        $ingStmt->execute([$queryCampId, $recipeId]);
+        $ingredients = $ingStmt->fetchAll();
 
-        $stockList = array_map(function ($a) {
-            return "{$a['name']} (stock: {$a['stock_qty']} {$a['uom']}, group: {$a['group_name']})";
-        }, $allItems);
-
-        $courseCtx = $course ? " as a {$course} course" : '';
-        $prompt = "You are a professional safari lodge chef at Karibu Camps in Tanzania. "
-            . "A chef is planning to cook \"{$dishName}\"{$courseCtx} for {$portions} portions. "
-            . "Suggest the main ingredients needed with exact quantities for {$portions} portions. "
-            . "\n\nIMPORTANT: You MUST only use ingredient names that EXACTLY match items from this stock list. "
-            . "Do not invent item names. Match the closest item from the list.\n\n"
-            . "Available stock items:\n" . implode("\n", array_slice($stockList, 0, 150))
-            . "\n\nFor each ingredient provide:"
-            . "\n- name: EXACT item name from the stock list above"
-            . "\n- qty: numeric quantity needed for {$portions} portions"
-            . "\n- uom: unit (kg, g, L, ml, pcs, etc.)"
-            . "\n- reason: brief reason why this ingredient is needed (1 sentence)"
-            . "\n- is_primary: true if it's a core ingredient, false if supplementary"
-            . "\n\nRespond as a JSON array of objects with keys: name, qty, uom, reason, is_primary."
-            . " Only return the JSON array, no other text.";
-
-        $result = callGemini($prompt);
-
-        // Match AI names back to real stock items
-        $suggestions = [];
-        if (is_array($result)) {
-            foreach ($result as $suggestion) {
-                $aiName = $suggestion['name'] ?? '';
-                $matched = matchItemByName($aiName, $allItems);
-                if ($matched) {
-                    $suggestions[] = [
-                        'item_id'    => (int) $matched['id'],
-                        'item_name'  => $matched['name'],
-                        'group_code' => $matched['group_code'],
-                        'stock_qty'  => (float) $matched['stock_qty'],
-                        'uom'        => $matched['uom'] ?: ($suggestion['uom'] ?? ''),
-                        'suggested_qty' => (float) ($suggestion['qty'] ?? 0),
-                        'reason'     => $suggestion['reason'] ?? '',
-                        'is_primary' => (bool) ($suggestion['is_primary'] ?? false),
-                    ];
+        // Filter out pantry staples
+        $filtered = [];
+        foreach ($ingredients as $ing) {
+            $nameLower = strtolower($ing['item_name']);
+            $isStaple = false;
+            foreach (PANTRY_STAPLES as $staple) {
+                if ($nameLower === strtolower($staple) || strpos($nameLower, strtolower($staple)) === 0) {
+                    $isStaple = true;
+                    break;
                 }
             }
+            if ($isStaple) continue;
+
+            $filtered[] = [
+                'item_id'       => (int) $ing['item_id'],
+                'item_name'     => $ing['item_name'],
+                'item_code'     => $ing['item_code'],
+                'uom'           => $ing['uom'],
+                'group_code'    => $ing['group_code'],
+                'qty_per_serving' => (float) $ing['qty_per_serving'],
+                'scaled_qty'    => round((float) $ing['qty_per_serving'] * $ratio, 3),
+                'is_primary'    => (bool) $ing['is_primary'],
+                'notes'         => $ing['notes'],
+                'stock_qty'     => (float) $ing['stock_qty'],
+            ];
         }
 
         jsonResponse([
-            'suggestions' => $suggestions,
-            'dish'        => $dishName,
-            'portions'    => $portions,
+            'recipe' => [
+                'id'   => (int) $recipe['id'],
+                'name' => $recipe['name'],
+                'serves' => $recipeServes,
+                'category' => $recipe['category'],
+            ],
+            'ingredients' => $filtered,
+            'portions' => $targetPortions,
+            'ratio' => round($ratio, 3),
         ]);
         exit;
     }
@@ -321,15 +324,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $dishPortions = (int) ($input['portions'] ?? $plan['portions'] ?? 20);
         if ($dishPortions < 1) $dishPortions = 20;
 
+        $recipeId = $input['recipe_id'] ?? null;
+        if ($recipeId) $recipeId = (int) $recipeId;
+
         $pdo->prepare("
-            INSERT INTO kitchen_menu_dishes (menu_plan_id, course, dish_name, portions, sort_order, created_at)
-            VALUES (?, ?, ?, ?, ?, NOW())
-        ")->execute([$planId, $course, $dish, $dishPortions, $nextSort]);
+            INSERT INTO kitchen_menu_dishes (menu_plan_id, course, dish_name, recipe_id, portions, sort_order, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, NOW())
+        ")->execute([$planId, $course, $dish, $recipeId, $dishPortions, $nextSort]);
 
         $dishId = (int) $pdo->lastInsertId();
 
         auditLog($pdo, $planId, $dishId, null, $userId, 'add_dish', null, [
-            'course' => $course, 'dish_name' => $dish, 'portions' => $dishPortions,
+            'course' => $course, 'dish_name' => $dish, 'portions' => $dishPortions, 'recipe_id' => $recipeId,
         ]);
 
         jsonResponse([
@@ -358,48 +364,83 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         exit;
     }
 
-    // ── Accept AI Suggestions ──
-    if ($action === 'accept_suggestions') {
-        $dishId      = (int) ($input['dish_id'] ?? 0);
-        $suggestions = $input['suggestions'] ?? [];
-        $portions    = (int) ($input['portions'] ?? 20);
-        if (!$dishId || empty($suggestions)) jsonError('dish_id and suggestions required', 400);
+    // ── Load Recipe Ingredients into a Dish ──
+    if ($action === 'load_recipe') {
+        $dishId   = (int) ($input['dish_id'] ?? 0);
+        $recipeId = (int) ($input['recipe_id'] ?? 0);
+        $portions = (int) ($input['portions'] ?? 0);
+        if (!$dishId || !$recipeId) jsonError('dish_id and recipe_id required', 400);
 
         $dish = getDish($pdo, $dishId, $queryCampId);
         $plan = getPlanForEdit($pdo, (int) $dish['menu_plan_id'], $queryCampId);
 
+        // Get recipe
+        $recipeStmt = $pdo->prepare("SELECT * FROM kitchen_recipes WHERE id = ? AND is_active = 1");
+        $recipeStmt->execute([$recipeId]);
+        $recipe = $recipeStmt->fetch();
+        if (!$recipe) jsonError('Recipe not found', 404);
+
+        $recipeServes = max((int) $recipe['serves'], 1);
+        $targetPortions = $portions > 0 ? $portions : (int) ($dish['portions'] ?? 20);
+        $ratio = $targetPortions / $recipeServes;
+
+        // Get recipe ingredients
+        $ingStmt = $pdo->prepare("
+            SELECT kri.*, i.name as item_name, u.code as uom
+            FROM kitchen_recipe_ingredients kri
+            JOIN items i ON kri.item_id = i.id
+            LEFT JOIN units_of_measure u ON i.stock_uom_id = u.id
+            WHERE kri.recipe_id = ?
+        ");
+        $ingStmt->execute([$recipeId]);
+        $recipeIngs = $ingStmt->fetchAll();
+
+        // Link dish to recipe
+        $pdo->prepare("UPDATE kitchen_menu_dishes SET recipe_id = ? WHERE id = ?")->execute([$recipeId, $dishId]);
+
         $insertStmt = $pdo->prepare("
             INSERT INTO kitchen_menu_ingredients (dish_id, item_id, suggested_qty, final_qty, uom, source, ai_reason, created_at)
-            VALUES (?, ?, ?, ?, ?, 'ai_suggested', ?, NOW())
+            VALUES (?, ?, ?, ?, ?, 'recipe', ?, NOW())
         ");
 
         $added = [];
-        foreach ($suggestions as $s) {
-            $itemId      = (int) ($s['item_id'] ?? 0);
-            $suggestedQty = (float) ($s['suggested_qty'] ?? 0);
-            $finalQty    = (float) ($s['final_qty'] ?? $suggestedQty);
-            $uom         = $s['uom'] ?? '';
-            $reason      = $s['reason'] ?? '';
-            if (!$itemId) continue;
+        foreach ($recipeIngs as $ri) {
+            $itemId = (int) $ri['item_id'];
+            $nameLower = strtolower($ri['item_name']);
 
-            // Skip if already exists for this dish
+            // Skip pantry staples
+            $isStaple = false;
+            foreach (PANTRY_STAPLES as $staple) {
+                if ($nameLower === strtolower($staple) || strpos($nameLower, strtolower($staple)) === 0) {
+                    $isStaple = true;
+                    break;
+                }
+            }
+            if ($isStaple) continue;
+
+            // Skip if already exists
             $exists = $pdo->prepare("SELECT id FROM kitchen_menu_ingredients WHERE dish_id = ? AND item_id = ? AND is_removed = 0");
             $exists->execute([$dishId, $itemId]);
             if ($exists->fetch()) continue;
 
-            $insertStmt->execute([$dishId, $itemId, $suggestedQty, $finalQty, $uom, $reason]);
-            $ingId = (int) $pdo->lastInsertId();
+            $baseQty  = (float) $ri['qty_per_serving'];
+            $finalQty = round($baseQty * $ratio, 3);
+            $uom = $ri['uom'] ?? '';
+            $note = $ri['notes'] ?? '';
 
+            $insertStmt->execute([$dishId, $itemId, $baseQty, $finalQty, $uom, $note]);
+            $ingId = (int) $pdo->lastInsertId();
             $added[] = $ingId;
 
-            auditLog($pdo, (int) $dish['menu_plan_id'], $dishId, $ingId, $userId, 'ai_suggest', null, [
-                'item_id' => $itemId, 'suggested_qty' => $suggestedQty, 'final_qty' => $finalQty, 'uom' => $uom,
+            auditLog($pdo, (int) $dish['menu_plan_id'], $dishId, $ingId, $userId, 'load_recipe', null, [
+                'item_id' => $itemId, 'recipe_qty' => $baseQty, 'final_qty' => $finalQty, 'uom' => $uom, 'recipe_id' => $recipeId,
             ]);
         }
 
         jsonResponse([
-            'message' => count($added) . ' ingredients added',
+            'message' => count($added) . ' ingredients loaded from recipe',
             'ingredient_ids' => $added,
+            'recipe_name' => $recipe['name'],
         ]);
         exit;
     }
@@ -471,9 +512,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $oldQty = (float) $ing['final_qty'];
 
-        // If it was ai_suggested and qty changed, mark as modified
+        // If it was recipe/ai_suggested and qty changed from original, mark as modified
         $newSource = $ing['source'];
-        if ($ing['source'] === 'ai_suggested' && abs($newQty - (float) $ing['suggested_qty']) > 0.001) {
+        if (in_array($ing['source'], ['ai_suggested', 'recipe']) && $ing['suggested_qty'] !== null && abs($newQty - (float) $ing['suggested_qty']) > 0.001) {
             $newSource = 'modified';
         }
 
@@ -557,6 +598,58 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         exit;
     }
 
+    // ── Rate Dish Presentation (Gemini Vision) ──
+    if ($action === 'rate_presentation') {
+        $dishId   = (int) ($input['dish_id'] ?? 0);
+        $photoUrl = trim($input['photo_url'] ?? '');
+        if (!$dishId || !$photoUrl) jsonError('dish_id and photo_url required', 400);
+
+        $dish = getDish($pdo, $dishId, $queryCampId);
+
+        // Build the full URL for the photo
+        $baseUrl = (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on' ? 'https' : 'http')
+            . '://' . $_SERVER['HTTP_HOST'];
+        $fullPhotoUrl = $baseUrl . $photoUrl;
+
+        // Call Gemini with vision prompt
+        $prompt = "You are a 5-star restaurant presentation judge at a luxury safari lodge. "
+            . "Score this dish photo on a 1-5 star scale.\n\n"
+            . "Evaluate these criteria:\n"
+            . "1. PLATING (arrangement, spacing, symmetry)\n"
+            . "2. COLOR (contrast, vibrancy, visual appeal)\n"
+            . "3. GARNISH (appropriate garnish, freshness)\n"
+            . "4. CLEANLINESS (plate edges clean, no smears)\n"
+            . "5. PORTION (appropriate size, not overcrowded)\n\n"
+            . "Return JSON: { \"score\": 1-5, \"feedback\": \"2-3 sentence critique\", \"tips\": [\"tip 1\", \"tip 2\"] }";
+
+        $result = callGeminiVision($prompt, $fullPhotoUrl);
+
+        $score    = (int) ($result['score'] ?? 0);
+        $feedback = $result['feedback'] ?? '';
+        $tips     = $result['tips'] ?? [];
+
+        if ($score < 1 || $score > 5) $score = 3; // Fallback
+
+        // Save to dish
+        $pdo->prepare("
+            UPDATE kitchen_menu_dishes
+            SET presentation_score = ?, presentation_feedback = ?, presentation_photo = ?
+            WHERE id = ?
+        ")->execute([$score, json_encode(['feedback' => $feedback, 'tips' => $tips]), $photoUrl, $dishId]);
+
+        auditLog($pdo, (int) $dish['menu_plan_id'], $dishId, null, $userId, 'rate_presentation', null, [
+            'score' => $score, 'photo' => $photoUrl,
+        ]);
+
+        jsonResponse([
+            'score'    => $score,
+            'feedback' => $feedback,
+            'tips'     => $tips,
+            'photo'    => $photoUrl,
+        ]);
+        exit;
+    }
+
     // ── Reopen Plan ──
     if ($action === 'reopen_plan') {
         $planId = (int) ($input['plan_id'] ?? 0);
@@ -594,71 +687,50 @@ requireMethod('GET');
 // ════════════════════════════════════════════════════════════
 
 /**
- * Call Gemini API and parse JSON response
+ * Call Gemini Vision API with image URL for presentation scoring
  */
-function callGemini(string $prompt): ?array {
+function callGeminiVision(string $prompt, string $imageUrl): ?array {
+    // Download image and convert to base64
+    $imageData = @file_get_contents($imageUrl);
+    if (!$imageData) return ['score' => 3, 'feedback' => 'Could not load image for analysis.', 'tips' => []];
+
+    $base64 = base64_encode($imageData);
+    $mimeType = 'image/jpeg'; // Default
+
     $ch = curl_init(GEMINI_URL);
     curl_setopt_array($ch, [
         CURLOPT_POST           => true,
         CURLOPT_POSTFIELDS     => json_encode([
-            'contents'         => [['parts' => [['text' => $prompt]]]],
-            'generationConfig' => ['temperature' => 0.7, 'maxOutputTokens' => 2048, 'responseMimeType' => 'application/json'],
+            'contents' => [[
+                'parts' => [
+                    ['text' => $prompt],
+                    ['inline_data' => ['mime_type' => $mimeType, 'data' => $base64]],
+                ],
+            ]],
+            'generationConfig' => ['temperature' => 0.5, 'maxOutputTokens' => 1024, 'responseMimeType' => 'application/json'],
         ]),
         CURLOPT_HTTPHEADER     => ['Content-Type: application/json'],
         CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_TIMEOUT        => 20,
+        CURLOPT_TIMEOUT        => 25,
         CURLOPT_SSL_VERIFYPEER => true,
     ]);
     $resp     = curl_exec($ch);
     $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     curl_close($ch);
 
-    if ($httpCode !== 200) return null;
+    if ($httpCode !== 200) return ['score' => 3, 'feedback' => 'AI analysis unavailable.', 'tips' => []];
 
     $data   = json_decode($resp, true);
     $text   = $data['candidates'][0]['content']['parts'][0]['text'] ?? '';
     $parsed = json_decode($text, true);
 
     if (!$parsed || !is_array($parsed)) {
-        if (preg_match('/\[[\s\S]*\]/', $text, $m)) {
+        if (preg_match('/\{[\s\S]*\}/', $text, $m)) {
             $parsed = json_decode($m[0], true);
         }
     }
 
-    return is_array($parsed) ? $parsed : null;
-}
-
-/**
- * Fuzzy match AI-returned item name to real stock item
- */
-function matchItemByName(string $aiName, array $items): ?array {
-    $aiLower = strtolower(trim($aiName));
-    if (!$aiLower) return null;
-
-    // Exact match first
-    foreach ($items as $item) {
-        if (strtolower($item['name']) === $aiLower) return $item;
-    }
-    // Contains match
-    foreach ($items as $item) {
-        $itemLower = strtolower($item['name']);
-        if (strpos($itemLower, $aiLower) !== false || strpos($aiLower, $itemLower) !== false) {
-            return $item;
-        }
-    }
-    // Word overlap match (at least 2 words match)
-    $aiWords = preg_split('/\s+/', $aiLower);
-    $bestMatch = null;
-    $bestScore = 0;
-    foreach ($items as $item) {
-        $itemWords = preg_split('/\s+/', strtolower($item['name']));
-        $overlap = count(array_intersect($aiWords, $itemWords));
-        if ($overlap >= 2 && $overlap > $bestScore) {
-            $bestScore = $overlap;
-            $bestMatch = $item;
-        }
-    }
-    return $bestMatch;
+    return is_array($parsed) ? $parsed : ['score' => 3, 'feedback' => 'Could not parse AI response.', 'tips' => []];
 }
 
 /**
@@ -703,17 +775,27 @@ function getFullPlanDishes(PDO $pdo, int $planId, int $campId): array {
             JOIN item_groups ig ON i.item_group_id = ig.id
             LEFT JOIN stock_balances sb ON sb.item_id = i.id AND sb.camp_id = ?
             WHERE mi.dish_id = ?
-            ORDER BY mi.source = 'ai_suggested' DESC, i.name
+            ORDER BY mi.source = 'recipe' DESC, mi.source = 'ai_suggested' DESC, i.name
         ");
         $ingStmt->execute([$campId, $d['id']]);
         $ingredients = $ingStmt->fetchAll();
 
+        // Parse presentation feedback
+        $presFeedback = null;
+        if ($d['presentation_feedback'] ?? null) {
+            $presFeedback = json_decode($d['presentation_feedback'], true);
+        }
+
         $result[] = [
-            'id'         => (int) $d['id'],
-            'course'     => $d['course'],
-            'dish_name'  => $d['dish_name'],
-            'portions'   => (int) ($d['portions'] ?? 20),
-            'sort_order' => (int) $d['sort_order'],
+            'id'                     => (int) $d['id'],
+            'course'                 => $d['course'],
+            'dish_name'              => $d['dish_name'],
+            'recipe_id'              => $d['recipe_id'] ? (int) $d['recipe_id'] : null,
+            'portions'               => (int) ($d['portions'] ?? 20),
+            'sort_order'             => (int) $d['sort_order'],
+            'presentation_score'     => $d['presentation_score'] ? (int) $d['presentation_score'] : null,
+            'presentation_feedback'  => $presFeedback,
+            'presentation_photo'     => $d['presentation_photo'] ?? null,
             'ingredients' => array_map(function ($ing) {
                 return [
                     'id'            => (int) $ing['id'],
