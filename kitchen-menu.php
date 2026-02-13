@@ -7,6 +7,7 @@
  * GET  ?action=audit&plan_id=X                         — audit trail for a plan
  * GET  ?action=recipe_ingredients&recipe_id=X&portions=N — recipe ingredients scaled to portions
  * GET  ?action=search_items&q=X                        — search kitchen stock items
+ * GET  ?action=weekly_ingredients&week_start=YYYY-MM-DD — aggregated non-primary ingredients for the week
  *
  * POST ?action=create_plan        — create a new menu plan (date + meal + portions)
  * POST ?action=add_dish           — add a dish to a plan (optionally linked to a recipe)
@@ -261,6 +262,59 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
         exit;
     }
 
+    // ── Weekly Ingredients (aggregated non-primary for the week) ──
+    if ($action === 'weekly_ingredients') {
+        $weekStart = $_GET['week_start'] ?? '';
+        if (!$weekStart) jsonError('week_start required (Monday date YYYY-MM-DD)', 400);
+
+        // Calculate week end (Sunday)
+        $weekEnd = date('Y-m-d', strtotime($weekStart . ' +6 days'));
+
+        $stmt = $pdo->prepare("
+            SELECT mi.item_id,
+                   i.name as item_name,
+                   i.item_code,
+                   u.code as uom,
+                   ig.code as group_code,
+                   SUM(mi.final_qty) as total_qty,
+                   COUNT(DISTINCT mi.dish_id) as dish_count,
+                   COALESCE(sb.current_qty, 0) as stock_qty
+            FROM kitchen_menu_ingredients mi
+            JOIN kitchen_menu_dishes d ON mi.dish_id = d.id
+            JOIN kitchen_menu_plans p ON d.menu_plan_id = p.id
+            JOIN items i ON mi.item_id = i.id
+            JOIN item_groups ig ON i.item_group_id = ig.id
+            LEFT JOIN units_of_measure u ON i.stock_uom_id = u.id
+            LEFT JOIN stock_balances sb ON sb.item_id = i.id AND sb.camp_id = ?
+            WHERE p.camp_id = ?
+              AND p.plan_date BETWEEN ? AND ?
+              AND mi.is_removed = 0
+              AND mi.is_primary = 0
+            GROUP BY mi.item_id, i.name, i.item_code, u.code, ig.code, sb.current_qty
+            ORDER BY i.name
+        ");
+        $stmt->execute([$queryCampId, $queryCampId, $weekStart, $weekEnd]);
+        $rows = $stmt->fetchAll();
+
+        jsonResponse([
+            'week_start' => $weekStart,
+            'week_end' => $weekEnd,
+            'ingredients' => array_map(function ($r) {
+                return [
+                    'item_id'    => (int) $r['item_id'],
+                    'item_name'  => $r['item_name'],
+                    'item_code'  => $r['item_code'],
+                    'uom'        => $r['uom'],
+                    'group_code' => $r['group_code'],
+                    'total_qty'  => round((float) $r['total_qty'], 3),
+                    'dish_count' => (int) $r['dish_count'],
+                    'stock_qty'  => (float) $r['stock_qty'],
+                ];
+            }, $rows),
+        ]);
+        exit;
+    }
+
     jsonError('Invalid action', 400);
     exit;
 }
@@ -399,8 +453,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $pdo->prepare("UPDATE kitchen_menu_dishes SET recipe_id = ? WHERE id = ?")->execute([$recipeId, $dishId]);
 
         $insertStmt = $pdo->prepare("
-            INSERT INTO kitchen_menu_ingredients (dish_id, item_id, suggested_qty, final_qty, uom, source, ai_reason, created_at)
-            VALUES (?, ?, ?, ?, ?, 'recipe', ?, NOW())
+            INSERT INTO kitchen_menu_ingredients (dish_id, item_id, suggested_qty, final_qty, uom, is_primary, source, ai_reason, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'recipe', ?, NOW())
         ");
 
         $added = [];
@@ -427,8 +481,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $finalQty = round($baseQty * $ratio, 3);
             $uom = $ri['uom'] ?? '';
             $note = $ri['notes'] ?? '';
+            $isPrimary = (int) ($ri['is_primary'] ?? 0);
 
-            $insertStmt->execute([$dishId, $itemId, $baseQty, $finalQty, $uom, $note]);
+            $insertStmt->execute([$dishId, $itemId, $baseQty, $finalQty, $uom, $isPrimary, $note]);
             $ingId = (int) $pdo->lastInsertId();
             $added[] = $ingId;
 
@@ -462,8 +517,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if ($exists->fetch()) jsonError('Ingredient already added to this dish', 409);
 
         $pdo->prepare("
-            INSERT INTO kitchen_menu_ingredients (dish_id, item_id, suggested_qty, final_qty, uom, source, created_at)
-            VALUES (?, ?, NULL, ?, ?, 'manual', NOW())
+            INSERT INTO kitchen_menu_ingredients (dish_id, item_id, suggested_qty, final_qty, uom, is_primary, source, created_at)
+            VALUES (?, ?, NULL, ?, ?, 1, 'manual', NOW())
         ")->execute([$dishId, $itemId, $qty, $uom]);
 
         $ingId = (int) $pdo->lastInsertId();
@@ -807,6 +862,7 @@ function getFullPlanDishes(PDO $pdo, int $planId, int $campId): array {
                     'final_qty'     => (float) $ing['final_qty'],
                     'uom'           => $ing['uom'],
                     'source'        => $ing['source'],
+                    'is_primary'    => (bool) ($ing['is_primary'] ?? 0),
                     'is_removed'    => (bool) $ing['is_removed'],
                     'removed_reason' => $ing['removed_reason'],
                     'ai_reason'     => $ing['ai_reason'],
