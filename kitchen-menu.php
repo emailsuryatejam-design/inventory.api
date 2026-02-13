@@ -8,6 +8,7 @@
  * GET  ?action=recipe_ingredients&recipe_id=X&portions=N — recipe ingredients scaled to portions
  * GET  ?action=search_items&q=X                        — search kitchen stock items
  * GET  ?action=weekly_ingredients&week_start=YYYY-MM-DD — aggregated non-primary ingredients for the week
+ * GET  ?action=default_menu&day=0-6&meal=lunch|dinner   — view default menu template for a day+meal
  *
  * POST ?action=create_plan        — create a new menu plan (date + meal + portions)
  * POST ?action=update_daily_tracking — update ordered/received/consumed qty on a menu ingredient
@@ -73,8 +74,57 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
         $plan = $stmt->fetch();
 
         if (!$plan) {
-            jsonResponse(['plan' => null, 'dishes' => []]);
-            exit;
+            // ── Auto-populate from default menu template ──
+            $dayOfWeek = (int) date('N', strtotime($date)) - 1; // 0=Mon..6=Sun
+            $defaults = $pdo->prepare("
+                SELECT * FROM kitchen_default_menu
+                WHERE day_of_week = ? AND meal_type = ?
+                  AND (camp_id IS NULL OR camp_id = ?)
+                  AND is_active = 1
+                ORDER BY sort_order
+            ");
+            $defaults->execute([$dayOfWeek, $meal, $queryCampId]);
+            $templateDishes = $defaults->fetchAll();
+
+            if (empty($templateDishes)) {
+                jsonResponse(['plan' => null, 'dishes' => []]);
+                exit;
+            }
+
+            // Auto-create the plan
+            $pdo->prepare("
+                INSERT INTO kitchen_menu_plans (camp_id, plan_date, meal_type, portions, status, created_by, created_at)
+                VALUES (?, ?, ?, 20, 'draft', ?, NOW())
+            ")->execute([$queryCampId, $date, $meal, $userId]);
+            $newPlanId = (int) $pdo->lastInsertId();
+
+            auditLog($pdo, $newPlanId, null, null, $userId, 'auto_populate_defaults', null, [
+                'date' => $date, 'meal' => $meal, 'template_count' => count($templateDishes),
+            ]);
+
+            // Insert each default dish + load recipe ingredients
+            foreach ($templateDishes as $tpl) {
+                $pdo->prepare("
+                    INSERT INTO kitchen_menu_dishes (menu_plan_id, course, dish_name, recipe_id, portions, sort_order, is_default, created_at)
+                    VALUES (?, ?, ?, ?, 20, ?, 1, NOW())
+                ")->execute([
+                    $newPlanId,
+                    $tpl['course'],
+                    $tpl['dish_name'],
+                    $tpl['recipe_id'] ?: null,
+                    (int) $tpl['sort_order'],
+                ]);
+                $newDishId = (int) $pdo->lastInsertId();
+
+                // If recipe matched, load ingredients automatically
+                if ($tpl['recipe_id']) {
+                    loadRecipeIntoDish($pdo, $newDishId, (int) $tpl['recipe_id'], 20, $newPlanId, $userId);
+                }
+            }
+
+            // Re-fetch the plan we just created
+            $stmt->execute([$queryCampId, $date, $meal]);
+            $plan = $stmt->fetch();
         }
 
         // Get dishes with ingredients
@@ -378,6 +428,40 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
         exit;
     }
 
+    // ── View Default Menu Template ──
+    if ($action === 'default_menu') {
+        $day  = isset($_GET['day']) ? (int) $_GET['day'] : -1;
+        $meal = $_GET['meal'] ?? '';
+        if ($day < 0 || $day > 6 || !$meal) jsonError('day (0-6) and meal required', 400);
+
+        $stmt = $pdo->prepare("
+            SELECT id, day_of_week, meal_type, course, dish_name, description, sort_order, recipe_id, is_active
+            FROM kitchen_default_menu
+            WHERE day_of_week = ? AND meal_type = ?
+              AND (camp_id IS NULL OR camp_id = ?)
+              AND is_active = 1
+            ORDER BY sort_order
+        ");
+        $stmt->execute([$day, $meal, $queryCampId]);
+        $rows = $stmt->fetchAll();
+
+        jsonResponse([
+            'day' => $day,
+            'meal' => $meal,
+            'dishes' => array_map(function ($r) {
+                return [
+                    'id'          => (int) $r['id'],
+                    'course'      => $r['course'],
+                    'dish_name'   => $r['dish_name'],
+                    'description' => $r['description'],
+                    'sort_order'  => (int) $r['sort_order'],
+                    'recipe_id'   => $r['recipe_id'] ? (int) $r['recipe_id'] : null,
+                ];
+            }, $rows),
+        ]);
+        exit;
+    }
+
     jsonError('Invalid action', 400);
     exit;
 }
@@ -468,6 +552,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if (!$dishId) jsonError('dish_id required', 400);
 
         $dish = getDish($pdo, $dishId, $queryCampId);
+
+        // Block removal of default template dishes
+        if (!empty($dish['is_default'])) {
+            jsonError('Cannot remove default menu dishes', 403);
+        }
+
         $plan = getPlanForEdit($pdo, (int) $dish['menu_plan_id'], $queryCampId);
 
         auditLog($pdo, (int) $dish['menu_plan_id'], $dishId, null, $userId, 'remove_dish', [
@@ -491,74 +581,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $dish = getDish($pdo, $dishId, $queryCampId);
         $plan = getPlanForEdit($pdo, (int) $dish['menu_plan_id'], $queryCampId);
 
-        // Get recipe
-        $recipeStmt = $pdo->prepare("SELECT * FROM kitchen_recipes WHERE id = ? AND is_active = 1");
-        $recipeStmt->execute([$recipeId]);
-        $recipe = $recipeStmt->fetch();
-        if (!$recipe) jsonError('Recipe not found', 404);
-
-        $recipeServes = max((int) $recipe['serves'], 1);
         $targetPortions = $portions > 0 ? $portions : (int) ($dish['portions'] ?? 20);
-        $ratio = $targetPortions / $recipeServes;
-
-        // Get recipe ingredients
-        $ingStmt = $pdo->prepare("
-            SELECT kri.*, i.name as item_name, u.code as uom
-            FROM kitchen_recipe_ingredients kri
-            JOIN items i ON kri.item_id = i.id
-            LEFT JOIN units_of_measure u ON i.stock_uom_id = u.id
-            WHERE kri.recipe_id = ?
-        ");
-        $ingStmt->execute([$recipeId]);
-        $recipeIngs = $ingStmt->fetchAll();
-
-        // Link dish to recipe
-        $pdo->prepare("UPDATE kitchen_menu_dishes SET recipe_id = ? WHERE id = ?")->execute([$recipeId, $dishId]);
-
-        $insertStmt = $pdo->prepare("
-            INSERT INTO kitchen_menu_ingredients (dish_id, item_id, suggested_qty, final_qty, uom, is_primary, source, ai_reason, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, 'recipe', ?, NOW())
-        ");
-
-        $added = [];
-        foreach ($recipeIngs as $ri) {
-            $itemId = (int) $ri['item_id'];
-            $nameLower = strtolower($ri['item_name']);
-
-            // Skip pantry staples
-            $isStaple = false;
-            foreach (PANTRY_STAPLES as $staple) {
-                if ($nameLower === strtolower($staple) || strpos($nameLower, strtolower($staple)) === 0) {
-                    $isStaple = true;
-                    break;
-                }
-            }
-            if ($isStaple) continue;
-
-            // Skip if already exists
-            $exists = $pdo->prepare("SELECT id FROM kitchen_menu_ingredients WHERE dish_id = ? AND item_id = ? AND is_removed = 0");
-            $exists->execute([$dishId, $itemId]);
-            if ($exists->fetch()) continue;
-
-            $baseQty  = (float) $ri['qty_per_serving'];
-            $finalQty = round($baseQty * $ratio, 3);
-            $uom = $ri['uom'] ?? '';
-            $note = $ri['notes'] ?? '';
-            $isPrimary = (int) ($ri['is_primary'] ?? 0);
-
-            $insertStmt->execute([$dishId, $itemId, $baseQty, $finalQty, $uom, $isPrimary, $note]);
-            $ingId = (int) $pdo->lastInsertId();
-            $added[] = $ingId;
-
-            auditLog($pdo, (int) $dish['menu_plan_id'], $dishId, $ingId, $userId, 'load_recipe', null, [
-                'item_id' => $itemId, 'recipe_qty' => $baseQty, 'final_qty' => $finalQty, 'uom' => $uom, 'recipe_id' => $recipeId,
-            ]);
-        }
+        $result = loadRecipeIntoDish($pdo, $dishId, $recipeId, $targetPortions, (int) $dish['menu_plan_id'], $userId);
 
         jsonResponse([
-            'message' => count($added) . ' ingredients loaded from recipe',
-            'ingredient_ids' => $added,
-            'recipe_name' => $recipe['name'],
+            'message' => count($result['added']) . ' ingredients loaded from recipe',
+            'ingredient_ids' => $result['added'],
+            'recipe_name' => $result['recipe_name'],
         ]);
         exit;
     }
@@ -994,6 +1023,7 @@ function getFullPlanDishes(PDO $pdo, int $planId, int $campId): array {
             'recipe_id'              => $d['recipe_id'] ? (int) $d['recipe_id'] : null,
             'portions'               => (int) ($d['portions'] ?? 20),
             'sort_order'             => (int) $d['sort_order'],
+            'is_default'             => (bool) ($d['is_default'] ?? 0),
             'presentation_score'     => $d['presentation_score'] ? (int) $d['presentation_score'] : null,
             'presentation_feedback'  => $presFeedback,
             'presentation_photo'     => $d['presentation_photo'] ?? null,
@@ -1022,6 +1052,79 @@ function getFullPlanDishes(PDO $pdo, int $planId, int $campId): array {
     }
 
     return $result;
+}
+
+/**
+ * Load recipe ingredients into a dish (reusable helper).
+ * Used by both load_recipe POST action and auto-populate defaults.
+ * Returns ['added' => [...ids], 'recipe_name' => '...']
+ */
+function loadRecipeIntoDish(PDO $pdo, int $dishId, int $recipeId, int $portions, int $planId, int $userId): array {
+    // Get recipe
+    $recipeStmt = $pdo->prepare("SELECT * FROM kitchen_recipes WHERE id = ? AND is_active = 1");
+    $recipeStmt->execute([$recipeId]);
+    $recipe = $recipeStmt->fetch();
+    if (!$recipe) return ['added' => [], 'recipe_name' => ''];
+
+    $recipeServes = max((int) $recipe['serves'], 1);
+    $targetPortions = $portions > 0 ? $portions : 20;
+    $ratio = $targetPortions / $recipeServes;
+
+    // Get recipe ingredients
+    $ingStmt = $pdo->prepare("
+        SELECT kri.*, i.name as item_name, u.code as uom
+        FROM kitchen_recipe_ingredients kri
+        JOIN items i ON kri.item_id = i.id
+        LEFT JOIN units_of_measure u ON i.stock_uom_id = u.id
+        WHERE kri.recipe_id = ?
+    ");
+    $ingStmt->execute([$recipeId]);
+    $recipeIngs = $ingStmt->fetchAll();
+
+    // Link dish to recipe
+    $pdo->prepare("UPDATE kitchen_menu_dishes SET recipe_id = ? WHERE id = ?")->execute([$recipeId, $dishId]);
+
+    $insertStmt = $pdo->prepare("
+        INSERT INTO kitchen_menu_ingredients (dish_id, item_id, suggested_qty, final_qty, uom, is_primary, source, ai_reason, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'recipe', ?, NOW())
+    ");
+
+    $added = [];
+    foreach ($recipeIngs as $ri) {
+        $itemId = (int) $ri['item_id'];
+        $nameLower = strtolower($ri['item_name']);
+
+        // Skip pantry staples
+        $isStaple = false;
+        foreach (PANTRY_STAPLES as $staple) {
+            if ($nameLower === strtolower($staple) || strpos($nameLower, strtolower($staple)) === 0) {
+                $isStaple = true;
+                break;
+            }
+        }
+        if ($isStaple) continue;
+
+        // Skip if already exists
+        $exists = $pdo->prepare("SELECT id FROM kitchen_menu_ingredients WHERE dish_id = ? AND item_id = ? AND is_removed = 0");
+        $exists->execute([$dishId, $itemId]);
+        if ($exists->fetch()) continue;
+
+        $baseQty  = (float) $ri['qty_per_serving'];
+        $finalQty = round($baseQty * $ratio, 3);
+        $uom = $ri['uom'] ?? '';
+        $note = $ri['notes'] ?? '';
+        $isPrimary = (int) ($ri['is_primary'] ?? 0);
+
+        $insertStmt->execute([$dishId, $itemId, $baseQty, $finalQty, $uom, $isPrimary, $note]);
+        $ingId = (int) $pdo->lastInsertId();
+        $added[] = $ingId;
+
+        auditLog($pdo, $planId, $dishId, $ingId, $userId, 'load_recipe', null, [
+            'item_id' => $itemId, 'recipe_qty' => $baseQty, 'final_qty' => $finalQty, 'uom' => $uom, 'recipe_id' => $recipeId,
+        ]);
+    }
+
+    return ['added' => $added, 'recipe_name' => $recipe['name']];
 }
 
 /**
