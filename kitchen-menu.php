@@ -318,15 +318,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $maxSort->execute([$planId, $course]);
         $nextSort = ((int) $maxSort->fetchColumn()) + 1;
 
+        $dishPortions = (int) ($input['portions'] ?? $plan['portions'] ?? 20);
+        if ($dishPortions < 1) $dishPortions = 20;
+
         $pdo->prepare("
-            INSERT INTO kitchen_menu_dishes (menu_plan_id, course, dish_name, sort_order, created_at)
-            VALUES (?, ?, ?, ?, NOW())
-        ")->execute([$planId, $course, $dish, $nextSort]);
+            INSERT INTO kitchen_menu_dishes (menu_plan_id, course, dish_name, portions, sort_order, created_at)
+            VALUES (?, ?, ?, ?, ?, NOW())
+        ")->execute([$planId, $course, $dish, $dishPortions, $nextSort]);
 
         $dishId = (int) $pdo->lastInsertId();
 
         auditLog($pdo, $planId, $dishId, null, $userId, 'add_dish', null, [
-            'course' => $course, 'dish_name' => $dish,
+            'course' => $course, 'dish_name' => $dish, 'portions' => $dishPortions,
         ]);
 
         jsonResponse([
@@ -489,14 +492,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         exit;
     }
 
-    // ── Update Portions (recalculates all ingredient quantities) ──
+    // ── Update Portions per dish (recalculates that dish's ingredient quantities) ──
     if ($action === 'update_portions') {
-        $planId      = (int) ($input['plan_id'] ?? 0);
+        $dishId      = (int) ($input['dish_id'] ?? 0);
         $newPortions = (int) ($input['portions'] ?? 0);
-        if (!$planId || $newPortions < 1) jsonError('plan_id and portions required', 400);
+        if (!$dishId || $newPortions < 1) jsonError('dish_id and portions required', 400);
 
-        $plan = getPlanForEdit($pdo, $planId, $queryCampId);
-        $oldPortions = (int) $plan['portions'];
+        $dish = getDish($pdo, $dishId, $queryCampId);
+        $plan = getPlanForEdit($pdo, (int) $dish['menu_plan_id'], $queryCampId);
+
+        $oldPortions = (int) ($dish['portions'] ?? 20);
 
         if ($oldPortions === $newPortions) {
             jsonResponse(['message' => 'Portions unchanged']);
@@ -505,20 +510,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $ratio = $newPortions / max($oldPortions, 1);
 
-        // Update plan portions
-        $pdo->prepare("UPDATE kitchen_menu_plans SET portions = ?, updated_at = NOW() WHERE id = ?")->execute([$newPortions, $planId]);
+        // Update dish portions
+        $pdo->prepare("UPDATE kitchen_menu_dishes SET portions = ? WHERE id = ?")->execute([$newPortions, $dishId]);
 
-        // Scale all non-removed ingredient quantities
+        // Scale this dish's non-removed ingredient quantities
         $pdo->prepare("
             UPDATE kitchen_menu_ingredients
             SET final_qty = ROUND(final_qty * ?, 3),
                 suggested_qty = CASE WHEN suggested_qty IS NOT NULL THEN ROUND(suggested_qty * ?, 3) ELSE NULL END,
                 updated_at = NOW()
-            WHERE dish_id IN (SELECT id FROM kitchen_menu_dishes WHERE menu_plan_id = ?)
-            AND is_removed = 0
-        ")->execute([$ratio, $ratio, $planId]);
+            WHERE dish_id = ? AND is_removed = 0
+        ")->execute([$ratio, $ratio, $dishId]);
 
-        auditLog($pdo, $planId, null, null, $userId, 'update_portions', [
+        auditLog($pdo, (int) $dish['menu_plan_id'], $dishId, null, $userId, 'update_portions', [
             'portions' => $oldPortions,
         ], [
             'portions' => $newPortions, 'ratio' => round($ratio, 3),
@@ -708,6 +712,7 @@ function getFullPlanDishes(PDO $pdo, int $planId, int $campId): array {
             'id'         => (int) $d['id'],
             'course'     => $d['course'],
             'dish_name'  => $d['dish_name'],
+            'portions'   => (int) ($d['portions'] ?? 20),
             'sort_order' => (int) $d['sort_order'],
             'ingredients' => array_map(function ($ing) {
                 return [
