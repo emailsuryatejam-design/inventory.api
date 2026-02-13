@@ -59,6 +59,110 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
     $action = $_GET['action'] ?? '';
     $queryCampId = $campId ?: ((int) ($_GET['camp_id'] ?? 0));
 
+    // ── Chef Init: plan + recipes in ONE call ──
+    // Eliminates a separate round-trip for recipes list
+    if ($action === 'chef_init') {
+        $date = $_GET['date'] ?? '';
+        $meal = $_GET['meal'] ?? '';
+        if (!$date || !$meal) jsonError('date and meal required', 400);
+
+        // 1. Get plan (same logic as 'plan' action below, inlined for speed)
+        $stmt = $pdo->prepare("
+            SELECT p.*, u.name as created_by_name
+            FROM kitchen_menu_plans p
+            LEFT JOIN users u ON p.created_by = u.id
+            WHERE p.camp_id = ? AND p.plan_date = ? AND p.meal_type = ?
+        ");
+        $stmt->execute([$queryCampId, $date, $meal]);
+        $plan = $stmt->fetch();
+
+        // Auto-populate from default menu template if needed
+        $needsPopulate = false;
+        $existingPlanId = null;
+        if (!$plan) {
+            $needsPopulate = true;
+        } else {
+            $dishCount = $pdo->prepare("SELECT COUNT(*) FROM kitchen_menu_dishes WHERE menu_plan_id = ?");
+            $dishCount->execute([$plan['id']]);
+            if ((int) $dishCount->fetchColumn() === 0) {
+                $needsPopulate = true;
+                $existingPlanId = (int) $plan['id'];
+            }
+        }
+
+        if ($needsPopulate) {
+            $dayOfWeek = (int) date('N', strtotime($date)) - 1;
+            $defaults = $pdo->prepare("
+                SELECT * FROM kitchen_default_menu
+                WHERE day_of_week = ? AND meal_type = ?
+                  AND (camp_id IS NULL OR camp_id = ?)
+                  AND is_active = 1
+                ORDER BY sort_order
+            ");
+            $defaults->execute([$dayOfWeek, $meal, $queryCampId]);
+            $templateDishes = $defaults->fetchAll();
+
+            if (!empty($templateDishes)) {
+                if ($existingPlanId) {
+                    $newPlanId = $existingPlanId;
+                } else {
+                    $pdo->prepare("
+                        INSERT INTO kitchen_menu_plans (camp_id, plan_date, meal_type, portions, status, created_by, created_at)
+                        VALUES (?, ?, ?, 20, 'draft', ?, NOW())
+                    ")->execute([$queryCampId, $date, $meal, $userId]);
+                    $newPlanId = (int) $pdo->lastInsertId();
+                }
+                auditLog($pdo, $newPlanId, null, null, $userId, 'auto_populate_defaults', null, [
+                    'date' => $date, 'meal' => $meal, 'template_count' => count($templateDishes),
+                ]);
+                foreach ($templateDishes as $tpl) {
+                    $pdo->prepare("
+                        INSERT INTO kitchen_menu_dishes (menu_plan_id, course, dish_name, recipe_id, portions, sort_order, is_default, created_at)
+                        VALUES (?, ?, ?, ?, 20, ?, 1, NOW())
+                    ")->execute([$newPlanId, $tpl['course'], $tpl['dish_name'], $tpl['recipe_id'] ?: null, (int) $tpl['sort_order']]);
+                    $newDishId = (int) $pdo->lastInsertId();
+                    if ($tpl['recipe_id']) {
+                        loadRecipeIntoDish($pdo, $newDishId, (int) $tpl['recipe_id'], 20, $newPlanId, $userId);
+                    } else {
+                        carryForwardIngredients($pdo, $newDishId, $tpl['dish_name'], $meal, $queryCampId, $newPlanId, $userId);
+                    }
+                }
+                $stmt->execute([$queryCampId, $date, $meal]);
+                $plan = $stmt->fetch();
+            }
+        }
+
+        $dishes = $plan ? getFullPlanDishes($pdo, (int) $plan['id'], $queryCampId) : [];
+
+        // 2. Get recipes list (same as kitchen.php?action=recipes)
+        $recStmt = $pdo->prepare("
+            SELECT r.id, r.name, r.category, r.cuisine, r.serves, r.difficulty,
+                   (SELECT COUNT(*) FROM kitchen_recipe_ingredients kri WHERE kri.recipe_id = r.id) as ingredient_count
+            FROM kitchen_recipes r
+            WHERE r.is_active = 1 AND (r.camp_id IS NULL OR r.camp_id = ?)
+            ORDER BY r.category, r.name
+        ");
+        $recStmt->execute([$queryCampId ?: 0]);
+        $recipes = $recStmt->fetchAll();
+
+        jsonResponse([
+            'plan' => $plan ? formatPlan($plan) : null,
+            'dishes' => $dishes,
+            'recipes' => array_map(function($r) {
+                return [
+                    'id' => (int) $r['id'],
+                    'name' => $r['name'],
+                    'category' => $r['category'],
+                    'cuisine' => $r['cuisine'],
+                    'serves' => (int) $r['serves'],
+                    'difficulty' => $r['difficulty'],
+                    'ingredient_count' => (int) $r['ingredient_count'],
+                ];
+            }, $recipes),
+        ]);
+        exit;
+    }
+
     // ── Get Single Menu Plan ──
     if ($action === 'plan') {
         $date = $_GET['date'] ?? '';
