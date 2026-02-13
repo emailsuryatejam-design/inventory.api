@@ -73,8 +73,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
         $stmt->execute([$queryCampId, $date, $meal]);
         $plan = $stmt->fetch();
 
+        // ── Auto-populate from default menu template ──
+        // Trigger when: no plan exists, OR plan exists but has zero dishes (pre-existing empty plan)
+        $needsPopulate = false;
+        $existingPlanId = null;
+
         if (!$plan) {
-            // ── Auto-populate from default menu template ──
+            $needsPopulate = true;
+        } else {
+            // Check if plan has any dishes already
+            $dishCount = $pdo->prepare("SELECT COUNT(*) FROM kitchen_menu_dishes WHERE menu_plan_id = ?");
+            $dishCount->execute([$plan['id']]);
+            if ((int) $dishCount->fetchColumn() === 0) {
+                $needsPopulate = true;
+                $existingPlanId = (int) $plan['id'];
+            }
+        }
+
+        if ($needsPopulate) {
             $dayOfWeek = (int) date('N', strtotime($date)) - 1; // 0=Mon..6=Sun
             $defaults = $pdo->prepare("
                 SELECT * FROM kitchen_default_menu
@@ -86,45 +102,49 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
             $defaults->execute([$dayOfWeek, $meal, $queryCampId]);
             $templateDishes = $defaults->fetchAll();
 
-            if (empty($templateDishes)) {
+            if (!empty($templateDishes)) {
+                // Use existing plan or create new one
+                if ($existingPlanId) {
+                    $newPlanId = $existingPlanId;
+                } else {
+                    $pdo->prepare("
+                        INSERT INTO kitchen_menu_plans (camp_id, plan_date, meal_type, portions, status, created_by, created_at)
+                        VALUES (?, ?, ?, 20, 'draft', ?, NOW())
+                    ")->execute([$queryCampId, $date, $meal, $userId]);
+                    $newPlanId = (int) $pdo->lastInsertId();
+                }
+
+                auditLog($pdo, $newPlanId, null, null, $userId, 'auto_populate_defaults', null, [
+                    'date' => $date, 'meal' => $meal, 'template_count' => count($templateDishes),
+                ]);
+
+                // Insert each default dish + load recipe ingredients
+                foreach ($templateDishes as $tpl) {
+                    $pdo->prepare("
+                        INSERT INTO kitchen_menu_dishes (menu_plan_id, course, dish_name, recipe_id, portions, sort_order, is_default, created_at)
+                        VALUES (?, ?, ?, ?, 20, ?, 1, NOW())
+                    ")->execute([
+                        $newPlanId,
+                        $tpl['course'],
+                        $tpl['dish_name'],
+                        $tpl['recipe_id'] ?: null,
+                        (int) $tpl['sort_order'],
+                    ]);
+                    $newDishId = (int) $pdo->lastInsertId();
+
+                    // If recipe matched, load ingredients automatically
+                    if ($tpl['recipe_id']) {
+                        loadRecipeIntoDish($pdo, $newDishId, (int) $tpl['recipe_id'], 20, $newPlanId, $userId);
+                    }
+                }
+
+                // Re-fetch the plan (newly created or existing)
+                $stmt->execute([$queryCampId, $date, $meal]);
+                $plan = $stmt->fetch();
+            } elseif (!$plan) {
                 jsonResponse(['plan' => null, 'dishes' => []]);
                 exit;
             }
-
-            // Auto-create the plan
-            $pdo->prepare("
-                INSERT INTO kitchen_menu_plans (camp_id, plan_date, meal_type, portions, status, created_by, created_at)
-                VALUES (?, ?, ?, 20, 'draft', ?, NOW())
-            ")->execute([$queryCampId, $date, $meal, $userId]);
-            $newPlanId = (int) $pdo->lastInsertId();
-
-            auditLog($pdo, $newPlanId, null, null, $userId, 'auto_populate_defaults', null, [
-                'date' => $date, 'meal' => $meal, 'template_count' => count($templateDishes),
-            ]);
-
-            // Insert each default dish + load recipe ingredients
-            foreach ($templateDishes as $tpl) {
-                $pdo->prepare("
-                    INSERT INTO kitchen_menu_dishes (menu_plan_id, course, dish_name, recipe_id, portions, sort_order, is_default, created_at)
-                    VALUES (?, ?, ?, ?, 20, ?, 1, NOW())
-                ")->execute([
-                    $newPlanId,
-                    $tpl['course'],
-                    $tpl['dish_name'],
-                    $tpl['recipe_id'] ?: null,
-                    (int) $tpl['sort_order'],
-                ]);
-                $newDishId = (int) $pdo->lastInsertId();
-
-                // If recipe matched, load ingredients automatically
-                if ($tpl['recipe_id']) {
-                    loadRecipeIntoDish($pdo, $newDishId, (int) $tpl['recipe_id'], 20, $newPlanId, $userId);
-                }
-            }
-
-            // Re-fetch the plan we just created
-            $stmt->execute([$queryCampId, $date, $meal]);
-            $plan = $stmt->fetch();
         }
 
         // Get dishes with ingredients
