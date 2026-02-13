@@ -22,9 +22,9 @@ try {
     $results[] = 'recipe_id: ' . $e->getMessage();
 }
 
-// 2. Add presentation columns
+// 2. Add presentation columns (add after recipe_id which was added above)
 try {
-    $pdo->exec("ALTER TABLE kitchen_menu_dishes ADD COLUMN presentation_score TINYINT UNSIGNED DEFAULT NULL AFTER portions");
+    $pdo->exec("ALTER TABLE kitchen_menu_dishes ADD COLUMN presentation_score TINYINT UNSIGNED DEFAULT NULL AFTER recipe_id");
     $results[] = 'Added presentation_score ✓';
 } catch (Exception $e) {
     $results[] = 'presentation_score: ' . $e->getMessage();
