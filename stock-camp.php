@@ -71,8 +71,10 @@ $stmt = $pdo->prepare("
     LEFT JOIN units_of_measure uom ON i.stock_uom_id = uom.id
     {$whereClause}
     ORDER BY i.item_code
-    LIMIT {$perPage} OFFSET {$offset}
+    LIMIT ? OFFSET ?
 ");
+$params[] = $perPage;
+$params[] = $offset;
 $stmt->execute($params);
 $stock = $stmt->fetchAll();
 

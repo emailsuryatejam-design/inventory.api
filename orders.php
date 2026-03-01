@@ -65,8 +65,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
         LEFT JOIN users sm ON o.stores_manager_id = sm.id
         {$whereClause}
         ORDER BY o.created_at DESC
-        LIMIT {$perPage} OFFSET {$offset}
+        LIMIT ? OFFSET ?
     ");
+    $params[] = $perPage;
+    $params[] = $offset;
     $stmt->execute($params);
     $orders = $stmt->fetchAll();
 
@@ -257,7 +259,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     } catch (Exception $e) {
         $pdo->rollBack();
-        jsonError('Failed to create order: ' . $e->getMessage(), 500);
+        error_log('[API Error] ' . $e->getMessage());
+        jsonError('An unexpected error occurred. Please try again.', 500);
     }
     exit;
 }

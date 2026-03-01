@@ -18,15 +18,25 @@ if (empty($_FILES['photo'])) {
 
 $file = $_FILES['photo'];
 
-// Validate
-$allowed = ['image/jpeg', 'image/png', 'image/webp', 'image/jpg'];
-if (!in_array($file['type'], $allowed)) {
-    jsonError('Invalid file type. Allowed: JPG, PNG, WebP', 400);
-}
-
+// Validate file size
 $maxSize = 10 * 1024 * 1024; // 10MB
 if ($file['size'] > $maxSize) {
     jsonError('File too large. Max 10MB', 400);
+}
+
+// Validate MIME type server-side (don't trust client-provided type)
+$allowed = ['image/jpeg', 'image/png', 'image/webp'];
+$finfo = finfo_open(FILEINFO_MIME_TYPE);
+$mimeType = finfo_file($finfo, $file['tmp_name']);
+finfo_close($finfo);
+if (!in_array($mimeType, $allowed)) {
+    jsonError('Invalid file type. Allowed: JPG, PNG, WebP', 400);
+}
+
+// Verify it's actually an image
+$imageInfo = getimagesize($file['tmp_name']);
+if ($imageInfo === false) {
+    jsonError('File is not a valid image', 400);
 }
 
 // Create upload dir
@@ -36,7 +46,8 @@ if (!is_dir($uploadDir)) {
 }
 
 // Generate unique filename
-$ext = pathinfo($file['name'], PATHINFO_EXTENSION) ?: 'jpg';
+$extMap = ['image/jpeg' => 'jpg', 'image/png' => 'png', 'image/webp' => 'webp'];
+$ext = $extMap[$mimeType] ?? 'jpg';
 $filename = 'dish_' . time() . '_' . bin2hex(random_bytes(4)) . '.' . $ext;
 $filepath = $uploadDir . '/' . $filename;
 

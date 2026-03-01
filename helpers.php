@@ -86,3 +86,28 @@ function validateOrderLine(array $line, float $campStock, float $hoStock, ?float
         'note' => implode('; ', $notes) ?: null,
     ];
 }
+
+// ── Input Validation Helpers ────────────────────────
+
+function validateInt($value, $min = null, $max = null) {
+    $v = filter_var($value, FILTER_VALIDATE_INT);
+    if ($v === false) return false;
+    if ($min !== null && $v < $min) return false;
+    if ($max !== null && $v > $max) return false;
+    return $v;
+}
+
+function validateNumeric($value, $min = null, $max = null) {
+    if (!is_numeric($value)) return false;
+    $v = (float)$value;
+    if ($min !== null && $v < $min) return false;
+    if ($max !== null && $v > $max) return false;
+    return $v;
+}
+
+function validatePagination($page, $perPage, $maxPerPage = 100) {
+    $page = validateInt($page, 1) ?: 1;
+    $perPage = validateInt($perPage, 1, $maxPerPage) ?: 20;
+    $offset = ($page - 1) * $perPage;
+    return [$page, $perPage, $offset];
+}

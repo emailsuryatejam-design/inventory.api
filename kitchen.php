@@ -25,7 +25,7 @@ $campId = $auth['camp_id'];
 $userId = $auth['user_id'];
 
 // Gemini config
-define('GEMINI_KEY', 'AIzaSyDso0Ae7zMkPuswSzrmPYfr9Q1KhQlls8c');
+define('GEMINI_KEY', env('GEMINI_API_KEY', ''));
 define('GEMINI_URL', 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=' . GEMINI_KEY);
 
 // Kitchen-relevant item group codes

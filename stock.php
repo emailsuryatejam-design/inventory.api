@@ -78,10 +78,12 @@ $sql = "
     ORDER BY
         FIELD(sb.stock_status, 'out', 'critical', 'low', 'ok', 'excess'),
         i.item_code ASC
-    LIMIT {$perPage} OFFSET {$offset}
+    LIMIT ? OFFSET ?
 ";
 
 $stmt = $pdo->prepare($sql);
+$params[] = $perPage;
+$params[] = $offset;
 $stmt->execute($params);
 $rows = $stmt->fetchAll();
 

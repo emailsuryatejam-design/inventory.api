@@ -121,5 +121,6 @@ try {
 
 } catch (Exception $e) {
     $pdo->rollBack();
-    jsonError('Failed to approve order: ' . $e->getMessage(), 500);
+    error_log('[API Error] ' . $e->getMessage());
+    jsonError('An unexpected error occurred. Please try again.', 500);
 }

@@ -4,20 +4,30 @@
  * Database credentials, constants, CORS headers
  */
 
+require_once __DIR__ . '/env.php';
+require_once __DIR__ . '/logger.php';
+
 // ── Database ────────────────────────────────────────
-define('DB_HOST', 'auth-db960.hstgr.io');
-define('DB_NAME', 'u929828006_KCLStores');
-define('DB_USER', 'u929828006_KCLStores');
-define('DB_PASS', '6145ury@Teja');
+define('DB_HOST', env('DB_HOST', 'localhost'));
+define('DB_NAME', env('DB_NAME', ''));
+define('DB_USER', env('DB_USER', ''));
+define('DB_PASS', env('DB_PASS', ''));
 
 // ── App Constants ───────────────────────────────────
 define('APP_NAME', 'KCL Stores');
-define('JWT_SECRET', 'kcl-stores-jwt-secret-karibu-2026');
+define('JWT_SECRET', env('JWT_SECRET', 'change-me-in-env-file'));
 define('JWT_EXPIRY', 8 * 3600); // 8 hours
-define('BASE_URL', 'https://darkblue-goshawk-672880.hostingersite.com');
+define('BASE_URL', env('APP_URL', ''));
 
-// ── CORS Headers ────────────────────────────────────
-header('Access-Control-Allow-Origin: *');
+// ── CORS Headers (restrict to allowed origins) ──────
+$allowedOrigins = array_map('trim', explode(',', env('ALLOWED_ORIGINS', '')));
+$origin = $_SERVER['HTTP_ORIGIN'] ?? '';
+if (in_array($origin, $allowedOrigins, true)) {
+    header("Access-Control-Allow-Origin: $origin");
+    header('Access-Control-Allow-Credentials: true');
+} elseif (env('DEBUG') === 'true') {
+    header('Access-Control-Allow-Origin: *');
+}
 header('Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS');
 header('Access-Control-Allow-Headers: Content-Type, Authorization');
 header('Content-Type: application/json; charset=utf-8');
@@ -41,6 +51,7 @@ function getDB() {
                 PDO::ATTR_PERSISTENT => true,
             ]);
         } catch (PDOException $e) {
+            appLog('error', 'Database connection failed', ['msg' => $e->getMessage()]);
             http_response_code(500);
             echo json_encode(['error' => 'Database connection failed']);
             exit;
@@ -58,7 +69,7 @@ function jsonResponse($data, $status = 200) {
 }
 
 function jsonError($message, $status = 400) {
-    jsonResponse(['error' => $message], $status);
+    jsonResponse(['error' => true, 'message' => $message, 'code' => $status], $status);
 }
 
 function getJsonInput() {

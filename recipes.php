@@ -16,7 +16,7 @@ $pdo = getDB();
 $campId = $auth['camp_id'];
 
 // Gemini API configuration
-define('GEMINI_API_KEY', 'AIzaSyDso0Ae7zMkPuswSzrmPYfr9Q1KhQlls8c');
+define('GEMINI_API_KEY', env('GEMINI_API_KEY', ''));
 define('GEMINI_MODEL', 'gemini-2.0-flash');
 define('GEMINI_ENDPOINT', 'https://generativelanguage.googleapis.com/v1beta/models/' . GEMINI_MODEL . ':generateContent');
 
@@ -149,7 +149,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         'type' => $type,
         'mood' => $mood ?: null,
         'available_ingredients' => count($availableList),
-        'camp_name' => $pdo->query("SELECT name FROM camps WHERE id = {$campId}")->fetchColumn(),
+        'camp_name' => (function() use ($pdo, $campId) { $stmt = $pdo->prepare("SELECT name FROM camps WHERE id = ?"); $stmt->execute([$campId]); return $stmt->fetchColumn(); })(),
     ]);
     exit;
 }

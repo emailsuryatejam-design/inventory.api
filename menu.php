@@ -285,7 +285,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
             . "Available stock:\n" . implode("\n", array_slice($stockList, 0, 60))
             . "\n\nRespond in JSON format as an array of objects with keys: name (exact item name from list), reason (1 sentence why it works as substitute). Only return the JSON array.";
 
-        define('GEMINI_API_KEY_MENU', 'AIzaSyDso0Ae7zMkPuswSzrmPYfr9Q1KhQlls8c');
+        define('GEMINI_API_KEY_MENU', env('GEMINI_API_KEY', ''));
         define('GEMINI_MODEL_MENU', 'gemini-2.0-flash');
         $endpoint = 'https://generativelanguage.googleapis.com/v1beta/models/' . GEMINI_MODEL_MENU . ':generateContent?key=' . GEMINI_API_KEY_MENU;
 
@@ -410,7 +410,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $costCenterId = $pdo->query("SELECT id FROM cost_centers WHERE is_active = 1 ORDER BY id LIMIT 1")->fetchColumn();
     }
 
-    $campCode = $pdo->query("SELECT code FROM camps WHERE id = {$campId}")->fetchColumn();
+    $campCodeStmt = $pdo->prepare("SELECT code FROM camps WHERE id = ?");
+    $campCodeStmt->execute([$campId]);
+    $campCode = $campCodeStmt->fetchColumn();
     $voucherNumber = generateDocNumber($pdo, 'BAR', $campCode);
 
     $pdo->beginTransaction();
@@ -524,7 +526,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     } catch (Exception $e) {
         $pdo->rollBack();
-        jsonError('Bar order failed: ' . $e->getMessage(), 500);
+        error_log('[API Error] ' . $e->getMessage());
+        jsonError('An unexpected error occurred. Please try again.', 500);
     }
     exit;
 }

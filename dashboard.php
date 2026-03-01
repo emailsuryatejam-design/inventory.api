@@ -13,22 +13,32 @@ $pdo = getDB();
 $campId = (int) ($_GET['camp_id'] ?? $auth['camp_id'] ?? 0);
 $today = date('Y-m-d');
 
-// ── Single query for all counts ──
+// ── Single query for all counts (parameterized) ──
+$campFilter = $campId ? "AND camp_id = ?" : "";
+$campWhere = $campId ? "WHERE camp_id = ?" : "";
+
 $countsSql = "
     SELECT
-        (SELECT COUNT(*) FROM orders WHERE status IN ('submitted', 'pending_review')
-            " . ($campId ? "AND camp_id = {$campId}" : '') . ") as pending_orders,
-        (SELECT COUNT(*) FROM stock_balances WHERE stock_status IN ('low', 'critical', 'out')
-            " . ($campId ? "AND camp_id = {$campId}" : '') . ") as low_stock_items,
-        (SELECT COUNT(*) FROM dispatches WHERE status IN ('dispatched', 'in_transit')
-            " . ($campId ? "AND camp_id = {$campId}" : '') . ") as pending_receipts,
-        (SELECT COUNT(*) FROM issue_vouchers WHERE DATE(issue_date) = '{$today}'
-            " . ($campId ? "AND camp_id = {$campId}" : '') . ") as issues_today,
-        (SELECT COALESCE(SUM(current_value), 0) FROM stock_balances
-            " . ($campId ? "WHERE camp_id = {$campId}" : '') . ") as total_stock_value,
+        (SELECT COUNT(*) FROM orders WHERE status IN ('submitted', 'pending_review') $campFilter) as pending_orders,
+        (SELECT COUNT(*) FROM stock_balances WHERE stock_status IN ('low', 'critical', 'out') $campFilter) as low_stock_items,
+        (SELECT COUNT(*) FROM dispatches WHERE status IN ('dispatched', 'in_transit') $campFilter) as pending_receipts,
+        (SELECT COUNT(*) FROM issue_vouchers WHERE DATE(issue_date) = ? $campFilter) as issues_today,
+        (SELECT COALESCE(SUM(current_value), 0) FROM stock_balances $campWhere) as total_stock_value,
         (SELECT COUNT(*) FROM items WHERE is_active = 1) as items_count
 ";
-$counts = $pdo->query($countsSql)->fetch();
+
+// Build params: one $campId per subquery that uses it + $today
+$countParams = [];
+if ($campId) $countParams[] = $campId; // pending_orders
+if ($campId) $countParams[] = $campId; // low_stock_items
+if ($campId) $countParams[] = $campId; // pending_receipts
+$countParams[] = $today;               // issues_today date
+if ($campId) $countParams[] = $campId; // issues_today camp
+if ($campId) $countParams[] = $campId; // total_stock_value
+
+$stmt = $pdo->prepare($countsSql);
+$stmt->execute($countParams);
+$counts = $stmt->fetch();
 
 $campParams = $campId ? [$campId] : [];
 

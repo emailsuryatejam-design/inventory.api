@@ -83,10 +83,12 @@ $sql = "
     LEFT JOIN units_of_measure iu ON i.issue_uom_id = iu.id
     {$whereClause}
     ORDER BY i.item_code ASC
-    LIMIT {$perPage} OFFSET {$offset}
+    LIMIT ? OFFSET ?
 ";
 
 $stmt = $pdo->prepare($sql);
+$params[] = $perPage;
+$params[] = $offset;
 $stmt->execute($params);
 $items = $stmt->fetchAll();
 

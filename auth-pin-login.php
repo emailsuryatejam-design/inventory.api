@@ -6,10 +6,16 @@
  */
 
 require_once __DIR__ . '/middleware.php';
+require_once __DIR__ . '/rate-limit.php';
+require_once __DIR__ . '/audit.php';
 
 requireMethod('POST');
 $input = getJsonInput();
 requireFields($input, ['username', 'pin']);
+
+// Rate limit: 5 attempts per IP+username per 5 minutes
+$rateLimitKey = ($_SERVER['REMOTE_ADDR'] ?? 'unknown') . ':pin:' . $input['username'];
+checkRateLimit($rateLimitKey);
 
 // Validate PIN format (4 digits)
 if (!preg_match('/^\d{4}$/', $input['pin'])) {
@@ -41,9 +47,11 @@ if (!password_verify($input['pin'], $user['pin_hash'])) {
     jsonError('Invalid username or PIN', 401);
 }
 
-// Update last login
+// Update last login & clear rate limit on success
 $pdo->prepare('UPDATE users SET last_login = NOW() WHERE id = ?')
     ->execute([$user['id']]);
+clearRateLimit($rateLimitKey);
+auditLog($pdo, 'login', (int) $user['id'], ['method' => 'pin']);
 
 // Generate JWT
 $token = jwtEncode([

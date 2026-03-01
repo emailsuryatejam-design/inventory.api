@@ -92,8 +92,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
             LEFT JOIN stock_balances sb ON sb.item_id = i.id AND sb.camp_id = ?
             WHERE {$whereClause}
             ORDER BY i.name
-            LIMIT {$limit}
+            LIMIT ?
         ");
+        $params[] = $limit;
         $stmt->execute($params);
         $items = $stmt->fetchAll();
 
@@ -132,9 +133,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
             LEFT JOIN users u ON iv.issued_by = u.id
             WHERE iv.camp_id = ?
             ORDER BY iv.created_at DESC
-            LIMIT {$limit}
+            LIMIT ?
         ");
-        $stmt->execute([$campId]);
+        $stmt->execute([$campId, $limit]);
         $vouchers = $stmt->fetchAll();
 
         jsonResponse([
@@ -350,7 +351,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     } catch (Exception $e) {
         $pdo->rollBack();
-        jsonError('POS transaction failed: ' . $e->getMessage(), 500);
+        error_log('[API Error] ' . $e->getMessage());
+        jsonError('An unexpected error occurred. Please try again.', 500);
     }
     exit;
 }

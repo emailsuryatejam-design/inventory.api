@@ -240,7 +240,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'PUT') {
 
     } catch (Exception $e) {
         $pdo->rollBack();
-        jsonError('Failed to confirm receipt: ' . $e->getMessage(), 500);
+        error_log('[API Error] ' . $e->getMessage());
+        jsonError('An unexpected error occurred. Please try again.', 500);
     }
     exit;
 }

@@ -19,7 +19,9 @@ requireFields($input, ['order_id', 'reason']);
 $pdo = getDB();
 $orderId = (int) $input['order_id'];
 
-$order = $pdo->query("SELECT * FROM orders WHERE id = {$orderId}")->fetch();
+$orderStmt = $pdo->prepare("SELECT * FROM orders WHERE id = ?");
+$orderStmt->execute([$orderId]);
+$order = $orderStmt->fetch();
 if (!$order) jsonError('Order not found', 404);
 
 if (!in_array($order['status'], ['submitted', 'pending_review', 'queried'])) {
@@ -51,5 +53,6 @@ try {
 
 } catch (Exception $e) {
     $pdo->rollBack();
-    jsonError('Failed to reject order: ' . $e->getMessage(), 500);
+    error_log('[API Error] ' . $e->getMessage());
+    jsonError('An unexpected error occurred. Please try again.', 500);
 }

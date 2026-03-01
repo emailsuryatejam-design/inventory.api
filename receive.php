@@ -47,8 +47,10 @@ $stmt = $pdo->prepare("
     LEFT JOIN users u ON r.received_by = u.id
     {$whereClause}
     ORDER BY r.created_at DESC
-    LIMIT {$perPage} OFFSET {$offset}
+    LIMIT ? OFFSET ?
 ");
+$params[] = $perPage;
+$params[] = $offset;
 $stmt->execute($params);
 $receipts = $stmt->fetchAll();
 

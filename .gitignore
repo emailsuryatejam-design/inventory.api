@@ -1,2 +1,8 @@
 # OS files
 .DS_Store
+
+# Environment (secrets)
+.env
+
+# Cache & logs
+cache/
