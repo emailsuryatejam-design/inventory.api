@@ -14,27 +14,39 @@ define('DB_USER', env('DB_USER', ''));
 define('DB_PASS', env('DB_PASS', ''));
 
 // ── App Constants ───────────────────────────────────
-define('APP_NAME', 'KCL Stores');
+define('APP_NAME', 'WebSquare');
 define('JWT_SECRET', env('JWT_SECRET', 'change-me-in-env-file'));
 define('JWT_EXPIRY', 8 * 3600); // 8 hours
 define('BASE_URL', env('APP_URL', ''));
 
-// ── CORS Headers (restrict to allowed origins) ──────
-$allowedOrigins = array_map('trim', explode(',', env('ALLOWED_ORIGINS', '')));
+// ── Abort if JWT_SECRET not configured ──────────────
+if (JWT_SECRET === 'change-me-in-env-file' && env('DEBUG') !== 'true') {
+    http_response_code(500);
+    echo json_encode(['error' => 'Server misconfigured']);
+    exit;
+}
+
+// ── CORS Headers ────────────────────────────────────
+// Same-origin (websquare.pro/api) needs no CORS headers.
+// Only allow explicit origins listed in .env for dev / mobile app.
+$allowedOrigins = array_filter(array_map('trim', explode(',', env('ALLOWED_ORIGINS', ''))));
 $origin = $_SERVER['HTTP_ORIGIN'] ?? '';
-if (in_array($origin, $allowedOrigins, true)) {
+
+if ($origin && !empty($allowedOrigins) && in_array($origin, $allowedOrigins, true)) {
     header("Access-Control-Allow-Origin: $origin");
     header('Access-Control-Allow-Credentials: true');
-} elseif (env('DEBUG') === 'true') {
-    header('Access-Control-Allow-Origin: *');
+    header('Vary: Origin');
 }
+// No wildcard CORS — not even in debug mode
+
 header('Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS');
 header('Access-Control-Allow-Headers: Content-Type, Authorization');
 header('Content-Type: application/json; charset=utf-8');
+header('X-Content-Type-Options: nosniff');
 
 // Handle preflight
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
-    http_response_code(200);
+    http_response_code(204);
     exit;
 }
 

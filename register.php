@@ -32,11 +32,19 @@ if (strlen($password) < 8) {
 $rateLimitKey = 'register:' . ($_SERVER['REMOTE_ADDR'] ?? 'unknown');
 checkRateLimit($rateLimitKey, 3, 900);
 
-$companyName = trim($input['company_name']);
-$name = trim($input['name']);
-$phone = trim($input['phone'] ?? '');
-$country = trim($input['country'] ?? '');
-$industry = trim($input['industry'] ?? '');
+// Sanitize all inputs — strip tags and limit lengths
+$companyName = mb_substr(strip_tags(trim($input['company_name'])), 0, 200);
+$name = mb_substr(strip_tags(trim($input['name'])), 0, 100);
+$phone = mb_substr(preg_replace('/[^\d+\-\s()]/', '', trim($input['phone'] ?? '')), 0, 30);
+$country = mb_substr(strip_tags(trim($input['country'] ?? '')), 0, 100);
+$industry = mb_substr(strip_tags(trim($input['industry'] ?? '')), 0, 100);
+
+if (strlen($companyName) < 2) {
+    jsonError('Company name is too short', 400);
+}
+if (strlen($name) < 2) {
+    jsonError('Name is too short', 400);
+}
 
 // Generate slug from company name
 $slug = strtolower(preg_replace('/[^a-zA-Z0-9]+/', '-', $companyName));
