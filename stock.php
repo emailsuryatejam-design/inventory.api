@@ -18,6 +18,7 @@ $offset = ($page - 1) * $perPage;
 $search = trim($_GET['search'] ?? '');
 $status = $_GET['status'] ?? '';
 $groupId = $_GET['group'] ?? '';
+$subCategoryId = $_GET['sub_category'] ?? '';
 
 // Build query
 $where = ['sb.current_qty > 0 OR sb.par_level > 0'];
@@ -42,6 +43,11 @@ if ($status && in_array($status, ['excess', 'ok', 'low', 'critical', 'out'])) {
 if ($groupId) {
     $where[] = 'i.item_group_id = ?';
     $params[] = (int) $groupId;
+}
+
+if ($subCategoryId) {
+    $where[] = 'i.sub_category_id = ?';
+    $params[] = (int) $subCategoryId;
 }
 
 $whereClause = 'WHERE ' . implode(' AND ', $where);
@@ -87,28 +93,35 @@ $params[] = $offset;
 $stmt->execute($params);
 $rows = $stmt->fetchAll();
 
-// Summary stats
-$summaryParams = $campId ? [$campId] : [];
-$campFilter = $campId ? 'WHERE sb.camp_id = ?' : '';
+// Summary stats — join items to respect tenant isolation, apply base filter
+$summaryWhere = ['(sb.current_qty > 0 OR sb.par_level > 0)'];
+$summaryParams = [];
+if ($campId) {
+    $summaryWhere[] = 'sb.camp_id = ?';
+    $summaryParams[] = $campId;
+}
+$summaryWhereClause = 'WHERE ' . implode(' AND ', $summaryWhere);
 
 $summaryStmt = $pdo->prepare("
     SELECT
         COUNT(*) as total_items,
-        SUM(sb.current_value) as total_value,
+        COALESCE(SUM(sb.current_value), 0) as total_value,
         SUM(CASE WHEN sb.stock_status = 'critical' THEN 1 ELSE 0 END) as critical_count,
         SUM(CASE WHEN sb.stock_status = 'low' THEN 1 ELSE 0 END) as low_count,
         SUM(CASE WHEN sb.stock_status = 'out' THEN 1 ELSE 0 END) as out_count,
         SUM(CASE WHEN sb.stock_status = 'ok' THEN 1 ELSE 0 END) as ok_count,
         SUM(CASE WHEN sb.stock_status = 'excess' THEN 1 ELSE 0 END) as excess_count
     FROM stock_balances sb
-    {$campFilter}
+    JOIN items i ON sb.item_id = i.id
+    {$summaryWhereClause}
 ");
 $summaryStmt->execute($summaryParams);
 $summary = $summaryStmt->fetch();
 
-// Load camps and groups for filters
+// Load camps, groups, and sub-categories for filters
 $camps = $pdo->query('SELECT id, code, name, type FROM camps WHERE is_active = 1 ORDER BY name')->fetchAll();
 $groups = $pdo->query('SELECT id, code, name FROM item_groups ORDER BY name')->fetchAll();
+$subCategories = $pdo->query('SELECT sc.id, sc.code, sc.name, sc.item_group_id, g.code as group_code FROM item_sub_categories sc LEFT JOIN item_groups g ON sc.item_group_id = g.id ORDER BY g.name, sc.name')->fetchAll();
 
 jsonResponse([
     'stock' => array_map(function($r) {
@@ -157,6 +170,9 @@ jsonResponse([
     'groups' => array_map(function($g) {
         return ['id' => (int) $g['id'], 'code' => $g['code'], 'name' => $g['name']];
     }, $groups),
+    'sub_categories' => array_map(function($sc) {
+        return ['id' => (int) $sc['id'], 'code' => $sc['code'], 'name' => $sc['name'], 'group_id' => (int) $sc['item_group_id'], 'group_code' => $sc['group_code']];
+    }, $subCategories),
     'pagination' => [
         'page' => $page,
         'per_page' => $perPage,
