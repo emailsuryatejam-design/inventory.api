@@ -74,7 +74,7 @@ function getStatus(PDO $pdo, int $tid): array {
     $orders = $count('orders');
     $dispatches = $count('dispatches');
     $recipes = $count('kitchen_recipes');
-    $menus = $count('menu_plans');
+    $menus = $count('kitchen_menu_plans');
 
     return [
         'sections' => [
@@ -95,16 +95,24 @@ function doDelete(PDO $pdo, int $tid, array $sections): array {
     $deleted = [];
 
     try {
+        // Safe delete — skips tables that don't exist
         $del = function($table) use ($pdo, $tid) {
-            $s = $pdo->prepare("DELETE FROM {$table} WHERE tenant_id = ?");
-            $s->execute([$tid]);
-            return $s->rowCount();
+            try {
+                $s = $pdo->prepare("DELETE FROM {$table} WHERE tenant_id = ?");
+                $s->execute([$tid]);
+                return $s->rowCount();
+            } catch (PDOException $e) {
+                if (strpos($e->getMessage(), '1146') !== false) {
+                    return 0; // table doesn't exist, skip
+                }
+                throw $e;
+            }
         };
 
         if (in_array('kitchen', $sections)) {
-            $deleted['menu_ingredients'] = $del('menu_ingredients');
-            $deleted['menu_dishes'] = $del('menu_dishes');
-            $deleted['menu_plans'] = $del('menu_plans');
+            $deleted['menu_ingredients'] = $del('kitchen_menu_ingredients');
+            $deleted['menu_dishes'] = $del('kitchen_menu_dishes');
+            $deleted['menu_plans'] = $del('kitchen_menu_plans');
             $deleted['recipe_ingredients'] = $del('kitchen_recipe_ingredients');
             $deleted['recipes'] = $del('kitchen_recipes');
         }
@@ -119,15 +127,17 @@ function doDelete(PDO $pdo, int $tid, array $sections): array {
             $deleted['dispatch_lines'] = $del('dispatch_lines');
             $deleted['dispatches'] = $del('dispatches');
             $deleted['grn_lines'] = $del('grn_lines');
-            $deleted['grns'] = $del('grns');
+            $deleted['grns'] = $del('goods_received_notes');
             $deleted['po_lines'] = $del('purchase_order_lines');
             $deleted['pos'] = $del('purchase_orders');
             $deleted['order_lines'] = $del('order_lines');
             $deleted['orders'] = $del('orders');
+            $deleted['adjustments'] = $del('stock_adjustment_lines');
+            $deleted['adjustments_hdr'] = $del('stock_adjustments');
         }
 
         if (in_array('hr', $sections)) {
-            $deleted['audit_log'] = $del('payroll_audit_log');
+            $deleted['audit_log'] = $del('audit_log');
             $deleted['field_tracking'] = $del('field_tracking');
             $deleted['attendance'] = $del('attendance');
             $deleted['payroll_items'] = $del('payroll_items');
