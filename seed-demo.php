@@ -95,23 +95,38 @@ function doDelete(PDO $pdo, int $tid, array $sections): array {
     $deleted = [];
 
     try {
-        // Safe delete — skips tables that don't exist
+        // Safe delete by tenant_id — skips missing tables or tables without tenant_id
         $del = function($table) use ($pdo, $tid) {
             try {
                 $s = $pdo->prepare("DELETE FROM {$table} WHERE tenant_id = ?");
                 $s->execute([$tid]);
                 return $s->rowCount();
             } catch (PDOException $e) {
-                if (strpos($e->getMessage(), '1146') !== false) {
-                    return 0; // table doesn't exist, skip
+                // 1146 = table doesn't exist, 1054 = column doesn't exist
+                if (strpos($e->getMessage(), '1146') !== false || strpos($e->getMessage(), '1054') !== false) {
+                    return 0;
+                }
+                throw $e;
+            }
+        };
+
+        // Delete child table rows via parent FK (for tables without tenant_id)
+        $delVia = function($child, $fk, $parent) use ($pdo, $tid) {
+            try {
+                $s = $pdo->prepare("DELETE c FROM {$child} c JOIN {$parent} p ON c.{$fk} = p.id WHERE p.tenant_id = ?");
+                $s->execute([$tid]);
+                return $s->rowCount();
+            } catch (PDOException $e) {
+                if (strpos($e->getMessage(), '1146') !== false || strpos($e->getMessage(), '1054') !== false) {
+                    return 0;
                 }
                 throw $e;
             }
         };
 
         if (in_array('kitchen', $sections)) {
-            $deleted['menu_ingredients'] = $del('kitchen_menu_ingredients');
-            $deleted['menu_dishes'] = $del('kitchen_menu_dishes');
+            $deleted['menu_ingredients'] = $delVia('kitchen_menu_ingredients', 'dish_id', 'kitchen_menu_dishes');
+            $deleted['menu_dishes'] = $delVia('kitchen_menu_dishes', 'menu_plan_id', 'kitchen_menu_plans');
             $deleted['menu_plans'] = $del('kitchen_menu_plans');
             $deleted['recipe_ingredients'] = $del('kitchen_recipe_ingredients');
             $deleted['recipes'] = $del('kitchen_recipes');
@@ -120,17 +135,17 @@ function doDelete(PDO $pdo, int $tid, array $sections): array {
         if (in_array('operations', $sections)) {
             $deleted['stock_movements'] = $del('stock_movements');
             $deleted['stock_balances'] = $del('stock_balances');
-            $deleted['issue_lines'] = $del('issue_voucher_lines');
+            $deleted['issue_lines'] = $delVia('issue_voucher_lines', 'voucher_id', 'issue_vouchers');
             $deleted['issue_vouchers'] = $del('issue_vouchers');
-            $deleted['receipt_lines'] = $del('receipt_lines');
+            $deleted['receipt_lines'] = $delVia('receipt_lines', 'receipt_id', 'receipts');
             $deleted['receipts'] = $del('receipts');
-            $deleted['dispatch_lines'] = $del('dispatch_lines');
+            $deleted['dispatch_lines'] = $delVia('dispatch_lines', 'dispatch_id', 'dispatches');
             $deleted['dispatches'] = $del('dispatches');
             $deleted['grn_lines'] = $del('grn_lines');
             $deleted['grns'] = $del('goods_received_notes');
-            $deleted['po_lines'] = $del('purchase_order_lines');
+            $deleted['po_lines'] = $delVia('purchase_order_lines', 'po_id', 'purchase_orders');
             $deleted['pos'] = $del('purchase_orders');
-            $deleted['order_lines'] = $del('order_lines');
+            $deleted['order_lines'] = $delVia('order_lines', 'order_id', 'orders');
             $deleted['orders'] = $del('orders');
             $deleted['adjustments'] = $del('stock_adjustment_lines');
             $deleted['adjustments_hdr'] = $del('stock_adjustments');
