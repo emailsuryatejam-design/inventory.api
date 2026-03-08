@@ -936,8 +936,8 @@ function seedOperations(PDO $pdo, int $tid, int $userId): array {
         VALUES (?,?,?,?,?,?,?,?,?,?,?)
     ");
     $lineStmt = $pdo->prepare("
-        INSERT IGNORE INTO order_lines (tenant_id, order_id, item_id, requested_qty, approved_qty, estimated_unit_cost, notes)
-        VALUES (?,?,?,?,?,?,?)
+        INSERT IGNORE INTO order_lines (order_id, item_id, requested_qty, estimated_unit_cost, estimated_line_value, validation_status, stores_action)
+        VALUES (?,?,?,?,?,'auto_approved','approved')
     ");
 
     for ($m = 11; $m >= 0; $m--) {
@@ -967,8 +967,9 @@ function seedOperations(PDO $pdo, int $tid, int $userId): array {
                     $item = $items[$itemIdx];
                     $qty = rand(1, 50);
                     $price = $item['last_purchase_price'] ?: rand(2000, 20000);
-                    $lineStmt->execute([$tid, $orderId, $item['id'], $qty, $qty, $price, null]);
-                    $totalValue += $qty * $price;
+                    $lineValue = $qty * $price;
+                    $lineStmt->execute([$orderId, $item['id'], $qty, $price, $lineValue]);
+                    $totalValue += $lineValue;
                     $stats['order_lines']++;
                 }
 
