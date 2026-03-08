@@ -220,7 +220,7 @@ function seedFoundation(PDO $pdo, int $tid): array {
         ['SRW', 'Serengeti West Camp', 'camp'],
     ];
 
-    $campStmt = $pdo->prepare("INSERT INTO camps (tenant_id, code, name, type, is_active) VALUES (?,?,?,?,1)");
+    $campStmt = $pdo->prepare("INSERT IGNORE INTO camps (tenant_id, code, name, type, is_active) VALUES (?,?,?,?,1)");
     $inserted = 0;
     foreach ($newCamps as $c) {
         if (!in_array($c[0], $existingCodes)) {
@@ -241,7 +241,7 @@ function seedFoundation(PDO $pdo, int $tid): array {
         ['CN','Can'],['BG','Bag'],['RL','Roll'],['DZ','Dozen'],
         ['PR','Pair'],['ST','Set'],['CS','Case'],
     ];
-    $uomStmt = $pdo->prepare("INSERT INTO units_of_measure (tenant_id, code, name) VALUES (?,?,?)");
+    $uomStmt = $pdo->prepare("INSERT IGNORE INTO units_of_measure (tenant_id, code, name) VALUES (?,?,?)");
     $ins = 0;
     foreach ($uoms as $u) {
         if (!in_array($u[0], $existUomCodes)) { $uomStmt->execute([$tid, $u[0], $u[1]]); $ins++; }
@@ -262,7 +262,7 @@ function seedFoundation(PDO $pdo, int $tid): array {
         ['LT','Linen & Textiles'],['MF','Medical & First Aid'],['FE','Fuel & Energy'],
         ['SE','Safari Equipment'],['LN','Laundry'],['PK','Packaging'],['GL','Gardening'],
     ];
-    $grpStmt = $pdo->prepare("INSERT INTO item_groups (tenant_id, code, name) VALUES (?,?,?)");
+    $grpStmt = $pdo->prepare("INSERT IGNORE INTO item_groups (tenant_id, code, name) VALUES (?,?,?)");
     $ins = 0;
     foreach ($groups as $g) {
         if (!in_array($g[0], $existGroupCodes)) { $grpStmt->execute([$tid, $g[0], $g[1]]); $ins++; }
@@ -305,7 +305,7 @@ function seedFoundation(PDO $pdo, int $tid): array {
         ['GL', [['FRT2','Fertilizers'],['GTL','Garden Tools'],['IRG','Irrigation']]],
     ];
 
-    $subStmt = $pdo->prepare("INSERT INTO item_sub_categories (tenant_id, code, name, item_group_id) VALUES (?,?,?,?)");
+    $subStmt = $pdo->prepare("INSERT IGNORE INTO item_sub_categories (tenant_id, code, name, item_group_id) VALUES (?,?,?,?)");
     $ins = 0;
     foreach ($subCats as [$grpCode, $subs]) {
         $gid = $grpIds[$grpCode] ?? null;
@@ -334,7 +334,7 @@ function seedFoundation(PDO $pdo, int $tid): array {
     $existSup = $pdo->prepare("SELECT COUNT(*) FROM suppliers WHERE tenant_id = ?");
     $existSup->execute([$tid]);
     if ((int)$existSup->fetchColumn() < 10) {
-        $supStmt = $pdo->prepare("INSERT INTO suppliers (tenant_id, supplier_code, name, contact_person, email, phone, city, country, payment_terms, is_active, created_at) VALUES (?,?,?,?,?,?,?,?,?,1,NOW())");
+        $supStmt = $pdo->prepare("INSERT IGNORE INTO suppliers (tenant_id, supplier_code, name, contact_person, email, phone, city, country, payment_terms, is_active, created_at) VALUES (?,?,?,?,?,?,?,?,?,1,NOW())");
         $suppliers = [
             ['SUP-001','Arusha Fresh Market','Juma Bakari','juma@arushafresh.co.tz','+255 754 100001','Arusha','Tanzania',7],
             ['SUP-002','Kilimanjaro Meats','Asha Mwenda','asha@kilimeats.co.tz','+255 754 100002','Arusha','Tanzania',14],
@@ -735,7 +735,7 @@ function seedItems(PDO $pdo, int $tid): array {
 
     // Now insert all items
     $itemStmt = $pdo->prepare("
-        INSERT INTO items (tenant_id, item_code, name, item_group_id, sub_category_id, stock_uom_id,
+        INSERT IGNORE INTO items (tenant_id, item_code, name, item_group_id, sub_category_id, stock_uom_id,
             purchase_uom_id, issue_uom_id, last_purchase_price, abc_class, storage_type,
             is_perishable, is_critical, is_active)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,1)
@@ -769,7 +769,7 @@ function seedHR(PDO $pdo, int $tid, int $userId): array {
     $stats = [];
 
     // Departments
-    $deptStmt = $pdo->prepare("INSERT INTO departments (tenant_id, name, code, is_active) VALUES (?,?,?,1)");
+    $deptStmt = $pdo->prepare("INSERT IGNORE INTO departments (tenant_id, name, code, is_active) VALUES (?,?,?,1)");
     $depts = [['Kitchen','KIT'],['Housekeeping','HSK'],['Front Office','FO'],['Maintenance','MNT'],
               ['Safari & Activities','SAF'],['Bar & Beverage','BAR'],['Administration','ADM'],['Transport','TRP']];
     foreach ($depts as $d) $deptStmt->execute([$tid, $d[0], $d[1]]);
@@ -782,7 +782,7 @@ function seedHR(PDO $pdo, int $tid, int $userId): array {
     foreach ($ds->fetchAll() as $r) $deptIds[$r['code']] = (int)$r['id'];
 
     // Job Grades
-    $jgStmt = $pdo->prepare("INSERT INTO job_grades (tenant_id, name, level, min_salary, max_salary) VALUES (?,?,?,?,?)");
+    $jgStmt = $pdo->prepare("INSERT IGNORE INTO job_grades (tenant_id, name, level, min_salary, max_salary) VALUES (?,?,?,?,?)");
     $jgs = [['Executive',1,2000000,5000000],['Senior Manager',2,1200000,2500000],['Manager',3,800000,1500000],
             ['Supervisor',4,500000,900000],['Staff',5,300000,600000],['Junior Staff',6,200000,400000]];
     foreach ($jgs as $j) $jgStmt->execute([$tid, $j[0], $j[1], $j[2], $j[3]]);
@@ -794,13 +794,13 @@ function seedHR(PDO $pdo, int $tid, int $userId): array {
     foreach ($js->fetchAll() as $r) $jgIds[$r['level']] = (int)$r['id'];
 
     // Regions
-    $regStmt = $pdo->prepare("INSERT INTO hr_regions (tenant_id, name, code, country) VALUES (?,?,?,'TZ')");
+    $regStmt = $pdo->prepare("INSERT IGNORE INTO hr_regions (tenant_id, name, code, country) VALUES (?,?,?,'TZ')");
     $regs = [['Northern Zone','NZ'],['Central Zone','CZ'],['Western Zone','WZ']];
     foreach ($regs as $r) $regStmt->execute([$tid, $r[0], $r[1]]);
     $stats['regions'] = 3;
 
     // Shifts
-    $shStmt = $pdo->prepare("INSERT INTO shifts (tenant_id, name, start_time, end_time, break_minutes, is_active) VALUES (?,?,?,?,?,1)");
+    $shStmt = $pdo->prepare("INSERT IGNORE INTO shifts (tenant_id, name, start_time, end_time, break_minutes, is_active) VALUES (?,?,?,?,?,1)");
     $shifts = [['Morning','06:00','14:00',30],['Afternoon','14:00','22:00',30],['Night','22:00','06:00',30],['Day','07:00','19:00',60]];
     foreach ($shifts as $s) $shStmt->execute([$tid, $s[0], $s[1], $s[2], $s[3]]);
     $stats['shifts'] = 4;
@@ -813,7 +813,7 @@ function seedHR(PDO $pdo, int $tid, int $userId): array {
 
     // Employees (~80)
     $empStmt = $pdo->prepare("
-        INSERT INTO hr_employees (tenant_id, employee_no, first_name, last_name, email, phone,
+        INSERT IGNORE INTO hr_employees (tenant_id, employee_no, first_name, last_name, email, phone,
             department_id, job_grade_id, employment_type, employment_status,
             gender, basic_salary, hire_date, camp_id, created_at)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,NOW())
@@ -857,7 +857,7 @@ function seedHR(PDO $pdo, int $tid, int $userId): array {
     $stats['employees'] = $empCount;
 
     // Leave Types
-    $ltStmt = $pdo->prepare("INSERT INTO leave_types (tenant_id, name, code, default_days, is_paid, accrual_method) VALUES (?,?,?,?,?,?)");
+    $ltStmt = $pdo->prepare("INSERT IGNORE INTO leave_types (tenant_id, name, code, default_days, is_paid, accrual_method) VALUES (?,?,?,?,?,?)");
     $lts = [['Annual Leave','AL',21,1,'annual'],['Sick Leave','SL',14,1,'annual'],
             ['Maternity Leave','ML',84,1,'none'],['Paternity Leave','PL',14,1,'none'],
             ['Compassionate Leave','CL',5,1,'none'],['Unpaid Leave','UL',30,0,'none'],
@@ -866,21 +866,21 @@ function seedHR(PDO $pdo, int $tid, int $userId): array {
     $stats['leave_types'] = count($lts);
 
     // Allowance & Deduction Types
-    $alStmt = $pdo->prepare("INSERT INTO allowance_types (tenant_id, name, code, is_taxable, is_fixed, default_amount) VALUES (?,?,?,?,?,?)");
+    $alStmt = $pdo->prepare("INSERT IGNORE INTO allowance_types (tenant_id, name, code, is_taxable, is_fixed, default_amount) VALUES (?,?,?,?,?,?)");
     $als = [['House Allowance','HSA',1,1,100000],['Transport Allowance','TRA',0,1,50000],
             ['Safari Allowance','SAF',0,0,30000],['Hardship Allowance','HDA',0,1,40000],
             ['Phone Allowance','PHA',0,1,20000]];
     foreach ($als as $a) $alStmt->execute([$tid, $a[0], $a[1], $a[2], $a[3], $a[4]]);
 
-    $deStmt = $pdo->prepare("INSERT INTO deduction_types (tenant_id, name, code, is_statutory, calculation_method) VALUES (?,?,?,?,?)");
+    $deStmt = $pdo->prepare("INSERT IGNORE INTO deduction_types (tenant_id, name, code, is_statutory, calculation_method) VALUES (?,?,?,?,?)");
     $des = [['NSSF','NSSF',1,'percentage'],['PAYE','PAYE',1,'tiered'],['NHIF','NHIF',1,'tiered'],
             ['Housing Levy','HL',1,'percentage'],['Union Fee','UNION',0,'fixed']];
     foreach ($des as $d) $deStmt->execute([$tid, $d[0], $d[1], $d[2], $d[3]]);
     $stats['allowance_deduction_types'] = count($als) + count($des);
 
     // Payroll Periods + Runs (12 months)
-    $ppStmt = $pdo->prepare("INSERT INTO payroll_periods (tenant_id, name, period_type, start_date, end_date, pay_date, status) VALUES (?,?,?,?,?,?,?)");
-    $prStmt = $pdo->prepare("INSERT INTO payroll_runs (tenant_id, period_id, status, employee_count, total_gross, total_net, total_deductions, total_employer_cost, created_by, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)");
+    $ppStmt = $pdo->prepare("INSERT IGNORE INTO payroll_periods (tenant_id, name, period_type, start_date, end_date, pay_date, status) VALUES (?,?,?,?,?,?,?)");
+    $prStmt = $pdo->prepare("INSERT IGNORE INTO payroll_runs (tenant_id, period_id, status, employee_count, total_gross, total_net, total_deductions, total_employer_cost, created_by, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)");
 
     for ($m = 0; $m < 12; $m++) {
         $start = date('Y-m-01', strtotime("-{$m} months"));
@@ -931,12 +931,12 @@ function seedOperations(PDO $pdo, int $tid, int $userId): array {
 
     // Create ~100 camp orders over 12 months
     $orderStmt = $pdo->prepare("
-        INSERT INTO orders (tenant_id, order_number, camp_id, status, created_by,
+        INSERT IGNORE INTO orders (tenant_id, order_number, camp_id, status, created_by,
             total_items, total_value, flagged_items, notes, created_at, updated_at)
         VALUES (?,?,?,?,?,?,?,?,?,?,?)
     ");
     $lineStmt = $pdo->prepare("
-        INSERT INTO order_lines (tenant_id, order_id, item_id, requested_qty, approved_qty, estimated_unit_cost, notes)
+        INSERT IGNORE INTO order_lines (tenant_id, order_id, item_id, requested_qty, approved_qty, estimated_unit_cost, notes)
         VALUES (?,?,?,?,?,?,?)
     ");
 
@@ -984,7 +984,7 @@ function seedOperations(PDO $pdo, int $tid, int $userId): array {
     $allItemRows = $allItems->fetchAll();
 
     $sbStmt = $pdo->prepare("
-        INSERT INTO stock_balances (tenant_id, camp_id, item_id, current_qty, current_value, unit_cost,
+        INSERT IGNORE INTO stock_balances (tenant_id, camp_id, item_id, current_qty, current_value, unit_cost,
             par_level, min_level, max_level, stock_status, updated_at)
         VALUES (?,?,?,?,?,?,?,?,?,?,NOW())
     ");
@@ -1031,12 +1031,12 @@ function seedKitchen(PDO $pdo, int $tid): array {
     };
 
     $recStmt = $pdo->prepare("
-        INSERT INTO kitchen_recipes (tenant_id, name, description, category, cuisine, serves,
+        INSERT IGNORE INTO kitchen_recipes (tenant_id, name, description, category, cuisine, serves,
             prep_time_minutes, cook_time_minutes, difficulty, instructions, created_at)
         VALUES (?,?,?,?,?,?,?,?,?,?,NOW())
     ");
     $ingStmt = $pdo->prepare("
-        INSERT INTO kitchen_recipe_ingredients (tenant_id, recipe_id, item_id, qty_per_serving, is_primary, notes)
+        INSERT IGNORE INTO kitchen_recipe_ingredients (tenant_id, recipe_id, item_id, qty_per_serving, is_primary, notes)
         VALUES (?,?,?,?,?,?)
     ");
 
